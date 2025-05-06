@@ -205,7 +205,12 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5):
 
             # Forward pass
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            # Check if loss_dict is a dictionary or a list
+            if isinstance(loss_dict, dict):
+                losses = sum(loss for loss in loss_dict.values())
+            else:
+                # If it's a list, sum directly
+                losses = sum(loss_dict) if isinstance(loss_dict, list) else loss_dict
 
             # Backward pass
             optimizer.zero_grad()
