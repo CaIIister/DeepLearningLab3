@@ -348,7 +348,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     # Learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer, mode='min', factor=0.5, patience=2
     )
 
     # Training loop
