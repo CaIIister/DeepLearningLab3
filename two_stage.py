@@ -138,7 +138,19 @@ class FastRCNNPredictor(torch.nn.Module):
         return scores, bbox_deltas
 
 
-# SIMPLIFIED TRAINING FUNCTION
+def extract_scalar_loss(loss_tensor):
+    """Extract a scalar loss from a tensor of any shape"""
+    if not isinstance(loss_tensor, torch.Tensor):
+        return 0.0
+
+    # If it's already a scalar tensor (0-dim), return it directly
+    if loss_tensor.dim() == 0:
+        return loss_tensor
+
+    # Otherwise, take the mean to reduce it to a scalar
+    return loss_tensor.mean()
+
+
 def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -219,95 +231,97 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     train_losses = []
     val_losses = []
 
+    # Define a custom training function that handles all model outputs properly
+    def compute_loss(model_output):
+        """Safely extract a scalar loss from any model output format"""
+        if isinstance(model_output, torch.Tensor):
+            return extract_scalar_loss(model_output)
+
+        if isinstance(model_output, dict):
+            return sum(extract_scalar_loss(loss) for loss in model_output.values())
+
+        if isinstance(model_output, list):
+            total = 0.0
+            for item in model_output:
+                if isinstance(item, dict):
+                    total += sum(extract_scalar_loss(loss) for loss in item.values())
+                else:
+                    total += extract_scalar_loss(item)
+            return total
+
+        # If none of the above, return a zero tensor
+        return torch.tensor(0.0, device=device)
+
     for epoch in range(num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs}")
 
         # Training
         model.train()
         epoch_loss = 0
-        num_batches = 0
+        batch_count = 0
 
         for images, targets in tqdm(data_loader_train):
+            batch_count += 1
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # SIMPLIFIED APPROACH: Use a direct loss approach
+            # Reset gradients
             optimizer.zero_grad()
 
-            # Forward pass with direct loss calculation
-            loss_dict = model(images, targets)
+            try:
+                # Forward pass
+                outputs = model(images, targets)
 
-            # Instead of trying to sum the losses, just use a hard-coded approach
-            # that will work for both dictionary and list returns
-            total_loss = torch.tensor(0.0, device=device)
+                # Compute loss (safely handling any output format)
+                loss = compute_loss(outputs)
 
-            # Handle various return types from the model
-            if isinstance(loss_dict, dict):
-                for loss_value in loss_dict.values():
-                    if isinstance(loss_value, torch.Tensor):
-                        total_loss += loss_value
-            elif isinstance(loss_dict, list):
-                for loss_item in loss_dict:
-                    if isinstance(loss_item, torch.Tensor):
-                        total_loss += loss_item
-                    elif isinstance(loss_item, dict):
-                        for loss_value in loss_item.values():
-                            if isinstance(loss_value, torch.Tensor):
-                                total_loss += loss_value
-            elif isinstance(loss_dict, torch.Tensor):
-                total_loss = loss_dict
+                # Backward pass
+                loss.backward()
 
-            # Backward pass
-            total_loss.backward()
-            optimizer.step()
+                # Update weights
+                optimizer.step()
 
-            epoch_loss += total_loss.item()
-            num_batches += 1
+                # Record loss
+                epoch_loss += loss.item()
+
+            except Exception as e:
+                print(f"Error in batch: {e}")
+                continue
 
         # Update learning rate
         lr_scheduler.step()
 
-        # Calculate average loss
-        avg_train_loss = epoch_loss / max(1, num_batches)
+        # Calculate average training loss
+        avg_train_loss = epoch_loss / max(1, batch_count)
         train_losses.append(avg_train_loss)
 
         # Validation
         model.eval()
         val_loss = 0
-        num_val_batches = 0
+        val_batch_count = 0
 
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
+                val_batch_count += 1
                 images = list(image.to(device) for image in images)
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                # Forward pass with direct loss calculation
-                loss_dict = model(images, targets)
+                try:
+                    # Forward pass
+                    outputs = model(images, targets)
 
-                # Use the same approach for validation
-                total_loss = torch.tensor(0.0, device=device)
+                    # Compute loss (safely handling any output format)
+                    loss = compute_loss(outputs)
 
-                # Handle various return types from the model
-                if isinstance(loss_dict, dict):
-                    for loss_value in loss_dict.values():
-                        if isinstance(loss_value, torch.Tensor):
-                            total_loss += loss_value
-                elif isinstance(loss_dict, list):
-                    for loss_item in loss_dict:
-                        if isinstance(loss_item, torch.Tensor):
-                            total_loss += loss_item
-                        elif isinstance(loss_item, dict):
-                            for loss_value in loss_item.values():
-                                if isinstance(loss_value, torch.Tensor):
-                                    total_loss += loss_value
-                elif isinstance(loss_dict, torch.Tensor):
-                    total_loss = loss_dict
+                    # Record loss
+                    val_loss += loss.item()
 
-                val_loss += total_loss.item()
-                num_val_batches += 1
+                except Exception as e:
+                    print(f"Error in validation batch: {e}")
+                    continue
 
         # Calculate average validation loss
-        avg_val_loss = val_loss / max(1, num_val_batches)
+        avg_val_loss = val_loss / max(1, val_batch_count)
         val_losses.append(avg_val_loss)
 
         print(f"Train Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
