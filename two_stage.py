@@ -219,9 +219,20 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
             # FIXED: Handle both list and dictionary return types
             if isinstance(loss_dict, dict):
                 losses = sum(loss for loss in loss_dict.values())
+            elif isinstance(loss_dict, list):
+                # Handle list of losses carefully
+                total_loss = 0
+                for loss in loss_dict:
+                    if isinstance(loss, dict):
+                        # If an element is a dictionary, sum its values
+                        total_loss += sum(v for v in loss.values())
+                    else:
+                        # If it's a number or tensor, add it directly
+                        total_loss += loss
+                losses = total_loss
             else:
-                # If it's a list or tensor, sum directly
-                losses = sum(loss_dict) if isinstance(loss_dict, list) else loss_dict
+                # If it's a single loss value
+                losses = loss_dict
 
             # Backward pass
             optimizer.zero_grad()
