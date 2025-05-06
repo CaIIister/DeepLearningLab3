@@ -14,7 +14,8 @@ import argparse
 
 # Define target classes - these are the ONLY classes we're working with
 TARGET_CLASSES = ['diningtable', 'sofa']
-CLASS_MAPPING = {cls: idx for idx, cls in enumerate(TARGET_CLASSES)}
+CLASS_MAPPING = {cls: idx + 1 for idx, cls in enumerate(TARGET_CLASSES)}  # Starting from 1 for RCNN
+CLASS_MAPPING_INV = {idx: cls for cls, idx in CLASS_MAPPING.items()}  # Inverse mapping
 
 
 # Custom collate function to avoid pickling issues
@@ -23,9 +24,10 @@ def collate_fn(batch):
 
 
 class CustomVOCDataset(Dataset):
-    def __init__(self, root, transforms=None):
+    def __init__(self, root, transforms=None, train=True):
         self.root = root
         self.transforms = transforms
+        self.train = train
 
         # Get list of images and annotations
         self.images = []
@@ -47,6 +49,8 @@ class CustomVOCDataset(Dataset):
             if os.path.exists(img_path) and self._has_target_classes(ann_path):
                 self.images.append(img_path)
                 self.annotations.append(ann_path)
+
+        print(f"Loaded {len(self.images)} images with {', '.join(TARGET_CLASSES)}")
 
     def _has_target_classes(self, ann_path):
         """Check if annotation contains target classes"""
@@ -73,25 +77,37 @@ class CustomVOCDataset(Dataset):
         boxes = []
         labels = []
 
+        # Get image dimensions
+        width = int(root.find('./size/width').text)
+        height = int(root.find('./size/height').text)
+
         for obj in root.findall('object'):
             class_name = obj.find('name').text
             if class_name in TARGET_CLASSES:
-                # Get class index (0 or 1 for our two classes)
+                # Get class index (1-indexed for RCNN models)
                 label = CLASS_MAPPING[class_name]
 
                 # Get bounding box
                 bbox = obj.find('bndbox')
-                xmin = float(bbox.find('xmin').text)
-                ymin = float(bbox.find('ymin').text)
-                xmax = float(bbox.find('xmax').text)
-                ymax = float(bbox.find('ymax').text)
+                xmin = max(0, float(bbox.find('xmin').text))
+                ymin = max(0, float(bbox.find('ymin').text))
+                xmax = min(width, float(bbox.find('xmax').text))
+                ymax = min(height, float(bbox.find('ymax').text))
+
+                # Skip invalid boxes
+                if xmin >= xmax or ymin >= ymax:
+                    continue
 
                 boxes.append([xmin, ymin, xmax, ymax])
                 labels.append(label)
 
         # Convert to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
+        if not boxes:  # Handle case with no valid boxes
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros(0, dtype=torch.int64)
+        else:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
 
         image_id = torch.tensor([idx])
         area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
@@ -106,8 +122,27 @@ class CustomVOCDataset(Dataset):
         target["area"] = area
         target["iscrowd"] = iscrowd
 
-        if self.transforms is not None:
+        # Apply data augmentation if training
+        if self.train and self.transforms is not None:
+            img, target = self.apply_transforms(img, target)
+        elif self.transforms is not None:
             img = self.transforms(img)
+
+        return img, target
+
+    def apply_transforms(self, img, target):
+        # Convert to tensor first
+        img = torchvision.transforms.functional.to_tensor(img)
+
+        # Apply random horizontal flip with 50% probability
+        if torch.rand(1) < 0.5:
+            img = torchvision.transforms.functional.hflip(img)
+            h, w = img.shape[-2:]
+
+            if target["boxes"].shape[0] > 0:
+                boxes = target["boxes"].clone()
+                boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
+                target["boxes"] = boxes
 
         return img, target
 
@@ -115,114 +150,145 @@ class CustomVOCDataset(Dataset):
         return len(self.images)
 
 
-def get_transform():
+def get_transform(train=True):
     transforms = []
     transforms.append(torchvision.transforms.ToTensor())
+
+    # Additional transforms for training data
+    if train:
+        transforms.append(torchvision.transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
+
     return torchvision.transforms.Compose(transforms)
 
 
-# Custom head for the model
-class FastRCNNPredictor(torch.nn.Module):
-    def __init__(self, in_channels, num_classes):
-        super(FastRCNNPredictor, self).__init__()
-        self.cls_score = torch.nn.Linear(in_channels, num_classes)
-        self.bbox_pred = torch.nn.Linear(in_channels, num_classes * 4)
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two bounding boxes"""
+    # Convert to [x1, y1, x2, y2] format
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
 
-    def forward(self, x):
-        if x.dim() == 4:
-            assert list(x.shape[2:]) == [1, 1]
-        x = x.flatten(start_dim=1)
-        scores = self.cls_score(x)
-        bbox_deltas = self.bbox_pred(x)
+    # Calculate area of intersection
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
+    intersection = w * h
 
-        return scores, bbox_deltas
+    # Calculate area of union
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = box1_area + box2_area - intersection
+
+    # Return IoU
+    return intersection / union if union > 0 else 0
 
 
-def extract_scalar_loss(loss_tensor):
-    """Extract a scalar loss with numerical stability"""
-    if not isinstance(loss_tensor, torch.Tensor):
+def calculate_map(predictions, targets, iou_threshold=0.5):
+    """Calculate mean Average Precision at specified IoU threshold"""
+    if not predictions or not targets:
         return 0.0
 
-    # Handle NaN/Inf values
-    if torch.isnan(loss_tensor).any() or torch.isinf(loss_tensor).any():
-        # Return a small value instead of propagating NaN
-        return torch.tensor(1e-5, device=loss_tensor.device)
+    # Initialize variables for mAP calculation
+    aps = []
 
-    # For scalar tensors
-    if loss_tensor.dim() == 0:
-        return loss_tensor.float()
+    # Process each class
+    for class_id in range(1, len(TARGET_CLASSES) + 1):
+        # Extract all predictions and ground truths for this class
+        class_preds = []
+        class_targets = []
 
-    # For tensors with dimensions
-    return torch.mean(loss_tensor.float())
+        for pred, target in zip(predictions, targets):
+            # Get predictions for this class
+            pred_indices = (pred['labels'] == class_id).nonzero(as_tuple=True)[0]
+            pred_boxes = pred['boxes'][pred_indices]
+            pred_scores = pred['scores'][pred_indices]
 
+            # Get ground truths for this class
+            target_indices = (target['labels'] == class_id).nonzero(as_tuple=True)[0]
+            target_boxes = target['boxes'][target_indices]
 
-def compute_loss(model_output):
-    """Safely extract a scalar loss from any model output format"""
-    if isinstance(model_output, torch.Tensor):
-        return extract_scalar_loss(model_output)
+            # Store predictions with scores and ground truths
+            for box, score in zip(pred_boxes, pred_scores):
+                class_preds.append((box, score))
 
-    if isinstance(model_output, dict):
-        return sum(extract_scalar_loss(loss) for loss in model_output.values())
+            for box in target_boxes:
+                class_targets.append((box, pred['image_id']))
 
-    if isinstance(model_output, list):
-        total = 0.0
-        for item in model_output:
-            if isinstance(item, dict):
-                total += sum(extract_scalar_loss(loss) for loss in item.values())
-            else:
-                total += extract_scalar_loss(item)
-        return total
-
-    # If none of the above, return a zero tensor
-    return torch.tensor(0.0)
-
-
-def compute_detection_metrics(detections, targets):
-    """Compute custom detection metrics instead of using direct loss calculation"""
-    total_loss = 0.0
-
-    for detection, target in zip(detections, targets):
-        # Skip if no detections or targets
-        if len(detection['boxes']) == 0 or len(target['boxes']) == 0:
+        # Skip if no predictions or targets for this class
+        if not class_preds or not class_targets:
             continue
 
-        # Calculate IoU between predicted and ground truth boxes
-        pred_boxes = detection['boxes']
-        gt_boxes = target['boxes']
+        # Sort predictions by confidence score (highest first)
+        class_preds.sort(key=lambda x: x[1], reverse=True)
 
-        # Simple metric: average confidence score of top predictions
-        scores = detection['scores']
-        if len(scores) > 0:
-            # Take top 5 scores or all if less than 5
-            top_k = min(5, len(scores))
-            top_scores = scores[:top_k]
-            score_metric = torch.mean(top_scores).item()
-            total_loss += (1.0 - score_metric)  # Convert to a loss (lower is better)
+        # Initialize variables for precision-recall calculation
+        tp = np.zeros(len(class_preds))
+        fp = np.zeros(len(class_preds))
+        gt_covered = set()
 
-    return total_loss
+        # For each prediction, check if it's a true positive
+        for i, (pred_box, _) in enumerate(class_preds):
+            # Find the best matching ground truth
+            best_iou = 0
+            best_gt_idx = -1
+
+            for j, (gt_box, img_id) in enumerate(class_targets):
+                # Skip already covered ground truths
+                if (img_id.item(), j) in gt_covered:
+                    continue
+
+                # Calculate IoU
+                iou = calculate_iou(pred_box, gt_box)
+
+                # Update best match
+                if iou > best_iou and iou >= iou_threshold:
+                    best_iou = iou
+                    best_gt_idx = j
+
+            # Check if we found a match
+            if best_gt_idx >= 0:
+                tp[i] = 1
+                gt_covered.add((class_targets[best_gt_idx][1].item(), best_gt_idx))
+            else:
+                fp[i] = 1
+
+        # Calculate cumulative sums
+        cumsum_tp = np.cumsum(tp)
+        cumsum_fp = np.cumsum(fp)
+
+        # Calculate precision and recall
+        precision = cumsum_tp / (cumsum_tp + cumsum_fp)
+        recall = cumsum_tp / len(class_targets)
+
+        # Calculate average precision
+        ap = 0
+        for t in np.arange(0, 1.1, 0.1):
+            if np.sum(recall >= t) == 0:
+                p = 0
+            else:
+                p = np.max(precision[recall >= t])
+            ap += p / 11
+
+        aps.append(ap)
+
+    # Calculate mAP
+    return np.mean(aps) if aps else 0.0
 
 
-def weights_init(m):
-    """Initialize network weights for better stability"""
-    if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
-        torch.nn.init.kaiming_normal_(m.weight)
-        if m.bias is not None:
-            torch.nn.init.zeros_(m.bias)
-
-
-def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0):
+def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0, early_stopping_patience=3):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
-    # Create dataset and dataloader
-    dataset = CustomVOCDataset(dataset_path, get_transform())
+    # Create dataset
+    dataset = CustomVOCDataset(dataset_path, transforms=None, train=True)
     full_size = len(dataset)
     print(f"Full dataset size: {full_size} images")
 
     # Apply subset size if less than 1.0
     if subset_size < 1.0:
-        subset_size = max(0.01, min(1.0, subset_size))  # Ensure it's between 0.01 and 1.0
+        subset_size = max(0.1, min(1.0, subset_size))  # Ensure it's between 0.1 and 1.0
         reduced_size = int(full_size * subset_size)
         indices = torch.randperm(full_size)[:reduced_size].tolist()
         dataset = torch.utils.data.Subset(dataset, indices)
@@ -256,35 +322,33 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     )
 
     # Create model - two-stage Faster R-CNN with ResNet50 backbone
-    num_classes = len(TARGET_CLASSES) + 1  # +1 for internal background handling
+    num_classes = len(TARGET_CLASSES) + 1  # +1 for background class
 
     if use_pretrained:
         print("Loading pre-trained model...")
-        # Load pre-trained model
+        # Load pre-trained model with default weights
         weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
         model = fasterrcnn_resnet50_fpn(weights=weights)
 
-        # Replace the classifier with a new one for our classes
+        # Replace classification head with a new one for our classes
         in_features = model.roi_heads.box_predictor.cls_score.in_features
-        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+        model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(in_features,
+                                                                                                   num_classes)
     else:
         print("Training model from scratch...")
-        # Create model from scratch
+        # Create model without pre-trained weights
         model = fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes)
-
-    # Apply weight initialization for better stability
-    model.apply(weights_init)
 
     # Move model to device
     model.to(device)
 
-    # Optimizer with reduced learning rate
+    # Optimizer with reduced learning rate for stability
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
 
-    # Learning rate scheduler - using ReduceLROnPlateau without the verbose parameter
+    # Learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.1, patience=2
+        optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
 
     # Training loop
@@ -293,22 +357,27 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
 
     # Track metrics
     train_losses = []
-    val_losses = []
+    val_maps = []
+    best_map = 0.0
+    patience_counter = 0
+    best_model_path = os.path.join(dataset_path, 'best_faster_rcnn_model.pth')
 
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        # Training
+        # Training phase
         model.train()
-        epoch_loss = 0
+        running_loss = 0.0
         batch_count = 0
 
         for images, targets in tqdm(data_loader_train):
             batch_count += 1
+
+            # Move data to device
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Skip empty batches
+            # Skip batches with no boxes
             if any(len(t['boxes']) == 0 for t in targets):
                 print("Skipping batch with empty targets")
                 continue
@@ -318,102 +387,126 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
 
             try:
                 # Forward pass
-                outputs = model(images, targets)
+                loss_dict = model(images, targets)
 
-                # Compute loss (safely handling any output format)
-                loss = compute_loss(outputs)
+                # Calculate standard loss (sum of all loss components)
+                losses = sum(loss for loss in loss_dict.values())
+                loss_value = losses.item()
 
-                # Check if loss is valid
-                if not torch.isfinite(loss):
-                    print(f"Warning: Non-finite loss detected: {loss.item()}")
+                # Check for valid loss
+                if not torch.isfinite(losses):
+                    print(f"Warning: Non-finite loss {loss_value}")
                     continue
 
-                # Backward pass
-                loss.backward()
+                # Backward pass and optimize
+                losses.backward()
 
                 # Add gradient clipping to prevent exploding gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                # Update weights
                 optimizer.step()
 
-                # Record loss
-                epoch_loss += loss.item()
+                # Update running loss
+                running_loss += loss_value
 
             except Exception as e:
-                print(f"Error in batch: {e}")
+                print(f"Error in training batch: {e}")
                 continue
 
         # Calculate average training loss
-        avg_train_loss = epoch_loss / max(1, batch_count)
-        train_losses.append(avg_train_loss)
+        epoch_loss = running_loss / max(1, batch_count)
+        train_losses.append(epoch_loss)
+        print(f"Training Loss: {epoch_loss:.4f}")
 
-        # Validation
+        # Validation phase
         model.eval()
-        val_loss = 0
-        val_batch_count = 0
+        all_predictions = []
+        all_targets = []
 
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
-                val_batch_count += 1
                 images = list(image.to(device) for image in images)
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                try:
-                    # During validation, we run the model in inference mode
-                    detections = model(images)
+                # Run model
+                outputs = model(images)
 
-                    # Compute custom validation metrics instead of direct loss
-                    batch_loss = compute_detection_metrics(detections, targets)
+                # Store predictions and targets for mAP calculation
+                all_predictions.extend([{k: v.cpu() for k, v in t.items()} for t in outputs])
+                all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
 
-                    # Record loss
-                    val_loss += batch_loss
+        # Calculate mAP
+        val_map = calculate_map(all_predictions, all_targets)
+        val_maps.append(val_map)
+        print(f"Validation mAP@0.5: {val_map:.4f}")
 
-                except Exception as e:
-                    print(f"Error in validation batch: {e}")
-                    continue
+        # Update learning rate scheduler
+        lr_scheduler.step(1.0 - val_map)  # Use inverted mAP as "loss" to minimize
 
-        # Calculate average validation loss
-        avg_val_loss = val_loss / max(1, val_batch_count)
-        val_losses.append(avg_val_loss)
+        # Check for improvement
+        if val_map > best_map:
+            best_map = val_map
+            patience_counter = 0
+            print(f"New best mAP: {best_map:.4f} - Saving model")
+            # Save best model
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs. Best mAP: {best_map:.4f}")
 
-        print(f"Train Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            print(f"Early stopping triggered after {epoch + 1} epochs")
+            break
 
-        # Update learning rate based on validation loss
-        lr_scheduler.step(avg_val_loss)
-
+    # Training complete
     total_time = time.time() - start_time
     print(f"Training complete in {total_time / 60:.2f} minutes")
 
-    # Save model
+    # Load best model
+    if os.path.exists(best_model_path):
+        print(f"Loading best model with mAP: {best_map:.4f}")
+        model.load_state_dict(torch.load(best_model_path))
+
+    # Save final model
     torch.save(model.state_dict(), os.path.join(dataset_path, 'faster_rcnn_model.pth'))
 
-    # Plot training and validation loss
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title('Training and Validation Loss')
+    # Plot training loss and validation mAP
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses)
+    plt.title('Training Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(dataset_path, 'training_loss.png'))
 
-    return model, train_losses, val_losses
+    plt.subplot(1, 2, 2)
+    plt.plot(val_maps)
+    plt.title('Validation mAP@0.5')
+    plt.xlabel('Epoch')
+    plt.ylabel('mAP')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(dataset_path, 'training_metrics.png'))
+    plt.close()
+
+    return model, train_losses, val_maps
 
 
-def evaluate_model(model, dataset_path, num_samples=5):
-    """Evaluate model on sample images from the dataset"""
+def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5):
+    """Evaluate model on sample images from the dataset with improved metrics"""
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model.to(device)
     model.eval()
 
     # Create dataset
-    dataset = CustomVOCDataset(dataset_path, get_transform())
+    dataset = CustomVOCDataset(dataset_path, transforms=get_transform(train=False))
 
-    # Get sample indices
+    # Get sample indices, either random or deterministic depending on implementation needs
     indices = torch.randperm(len(dataset))[:num_samples].tolist()
 
     results = []
+    all_predictions = []
+    all_targets = []
 
     for idx in indices:
         # Get image and target
@@ -423,76 +516,207 @@ def evaluate_model(model, dataset_path, num_samples=5):
         with torch.no_grad():
             prediction = model([img.to(device)])[0]
 
-        # Convert image to numpy for visualization
-        img = img.permute(1, 2, 0).cpu().numpy()
+        # Convert tensors to CPU for processing
+        prediction = {k: v.cpu() for k, v in prediction.items()}
 
-        # Get boxes, labels and scores
-        pred_boxes = prediction['boxes'].cpu().numpy()
-        pred_labels = prediction['labels'].cpu().numpy()
-        pred_scores = prediction['scores'].cpu().numpy()
+        # Convert image for visualization
+        img_numpy = img.permute(1, 2, 0).cpu().numpy()
 
-        # Get ground truth boxes and labels
-        gt_boxes = target['boxes'].cpu().numpy()
-        gt_labels = target['labels'].cpu().numpy()
+        # Filter predictions by confidence threshold
+        keep_indices = prediction['scores'] >= confidence_threshold
+        filtered_boxes = prediction['boxes'][keep_indices]
+        filtered_labels = prediction['labels'][keep_indices]
+        filtered_scores = prediction['scores'][keep_indices]
 
+        # Store for metrics calculation
+        all_predictions.append(prediction)
+        all_targets.append(target)
+
+        # Calculate IoUs for each prediction with ground truth
+        ious = []
+        matches = []
+
+        for pred_box, pred_label in zip(filtered_boxes, filtered_labels):
+            best_iou = 0
+            for gt_box, gt_label in zip(target['boxes'], target['labels']):
+                if pred_label == gt_label:
+                    iou = calculate_iou(pred_box, gt_box)
+                    best_iou = max(best_iou, iou)
+            ious.append(best_iou)
+            matches.append(best_iou >= 0.5)  # True if IoU >= 0.5
+
+        # Calculate precision and recall for this image
+        tp = sum(matches)
+        fp = len(matches) - tp
+        fn = len(target['boxes']) - tp
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        # Store result
         results.append({
-            'image': img,
-            'pred_boxes': pred_boxes,
-            'pred_labels': pred_labels,
-            'pred_scores': pred_scores,
-            'gt_boxes': gt_boxes,
-            'gt_labels': gt_labels
+            'image': img_numpy,
+            'pred_boxes': filtered_boxes.numpy(),
+            'pred_labels': filtered_labels.numpy(),
+            'pred_scores': filtered_scores.numpy(),
+            'gt_boxes': target['boxes'].numpy(),
+            'gt_labels': target['labels'].numpy(),
+            'ious': ious,
+            'precision': precision,
+            'recall': recall
         })
 
-    return results
+    # Calculate overall metrics
+    map_score = calculate_map(all_predictions, all_targets)
+
+    # Print metrics
+    print(f"Evaluation Metrics:")
+    print(f"  mAP@0.5: {map_score:.4f}")
+
+    avg_precision = np.mean([r['precision'] for r in results])
+    avg_recall = np.mean([r['recall'] for r in results])
+
+    print(f"  Average Precision: {avg_precision:.4f}")
+    print(f"  Average Recall: {avg_recall:.4f}")
+
+    metrics = {
+        'map': map_score,
+        'precision': avg_precision,
+        'recall': avg_recall
+    }
+
+    return results, metrics
 
 
-def visualize_results(results, dataset_path):
-    """Visualize detection results"""
+def visualize_results(results, dataset_path, metrics=None):
+    """Visualize detection results with improved formatting"""
     class_names = TARGET_CLASSES
 
-    for i, result in enumerate(results):
-        plt.figure(figsize=(12, 6))
+    # Create results directory if it doesn't exist
+    results_dir = os.path.join(dataset_path, 'results')
+    os.makedirs(results_dir, exist_ok=True)
 
+    # Create a summary figure with all results
+    plt.figure(figsize=(15, 5 * len(results)))
+
+    # Add metrics to title if available
+    title = "Object Detection Results"
+    if metrics:
+        title += f" (mAP@0.5: {metrics['map']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f})"
+
+    plt.suptitle(title, fontsize=16)
+
+    for i, result in enumerate(results):
         # Plot ground truth
-        plt.subplot(1, 2, 1)
+        plt.subplot(len(results), 2, 2 * i + 1)
         plt.imshow(result['image'])
-        plt.title('Ground Truth')
+        plt.title(f'Ground Truth (Image {i + 1})')
+        plt.axis('off')
 
         for box, label in zip(result['gt_boxes'], result['gt_labels']):
             x1, y1, x2, y2 = box
             plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
                                               fill=False, edgecolor='green', linewidth=2))
-            plt.text(x1, y1, class_names[label],
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, cls_name,
                      bbox=dict(facecolor='green', alpha=0.5))
 
         # Plot predictions
+        plt.subplot(len(results), 2, 2 * i + 2)
+        plt.imshow(result['image'])
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.axis('off')
+
+        for j, (box, label, score) in enumerate(zip(result['pred_boxes'],
+                                                    result['pred_labels'],
+                                                    result['pred_scores'])):
+            x1, y1, x2, y2 = box
+
+            # Color based on IoU if available
+            color = 'red'
+            if 'ious' in result and j < len(result['ious']):
+                iou = result['ious'][j]
+                # Green for good matches, yellow for okay, red for poor
+                if iou >= 0.7:
+                    color = 'lime'
+                elif iou >= 0.5:
+                    color = 'yellow'
+
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor=color, linewidth=2))
+
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            iou_text = f", IoU: {result['ious'][j]:.2f}" if 'ious' in result and j < len(result['ious']) else ""
+
+            plt.text(x1, y1, f"{cls_name}: {score:.2f}{iou_text}",
+                     bbox=dict(facecolor=color, alpha=0.5))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])  # Adjust layout for the title
+    plt.savefig(os.path.join(results_dir, 'detection_results.png'), dpi=200)
+    plt.close()
+
+    # Also save individual result images for better detail
+    for i, result in enumerate(results):
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, 2, 1)
+        plt.imshow(result['image'])
+        plt.title('Ground Truth')
+        plt.axis('off')
+
+        for box, label in zip(result['gt_boxes'], result['gt_labels']):
+            x1, y1, x2, y2 = box
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor='green', linewidth=2))
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, cls_name,
+                     bbox=dict(facecolor='green', alpha=0.5))
+
         plt.subplot(1, 2, 2)
         plt.imshow(result['image'])
-        plt.title('Predictions')
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.axis('off')
 
-        for box, label, score in zip(result['pred_boxes'], result['pred_labels'], result['pred_scores']):
-            if score > 0.5:  # Only show predictions with confidence > 0.5
-                x1, y1, x2, y2 = box
-                plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                                                  fill=False, edgecolor='red', linewidth=2))
-                plt.text(x1, y1, f"{class_names[label - 1]}: {score:.2f}",
-                         bbox=dict(facecolor='red', alpha=0.5))
+        for j, (box, label, score) in enumerate(zip(result['pred_boxes'],
+                                                    result['pred_labels'],
+                                                    result['pred_scores'])):
+            x1, y1, x2, y2 = box
 
-        plt.savefig(os.path.join(dataset_path, f'result_{i}.png'))
+            # Color based on IoU
+            color = 'red'
+            if 'ious' in result and j < len(result['ious']):
+                iou = result['ious'][j]
+                if iou >= 0.7:
+                    color = 'lime'
+                elif iou >= 0.5:
+                    color = 'yellow'
+
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor=color, linewidth=2))
+
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, f"{cls_name}: {score:.2f}, IoU: {result['ious'][j]:.2f}",
+                     bbox=dict(facecolor=color, alpha=0.5))
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f'result_{i}.png'), dpi=200)
         plt.close()
+
+    print(f"Visualizations saved to {results_dir}")
+    return os.path.join(results_dir, 'detection_results.png')
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Two-Stage Object Detection using Faster R-CNN')
     parser.add_argument('--dataset_path', type=str, default='dataset_E4888', help='Path to the dataset')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
     parser.add_argument('--subset_size', type=float, default=1.0,
                         help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     parser.add_argument('--skip_scratch', action='store_true', help='Skip training from scratch')
     parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with pretrained weights')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
+    parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for evaluation')
     return parser.parse_args()
 
 
@@ -509,18 +733,19 @@ if __name__ == "__main__":
         # Train model from scratch
         if not args.skip_scratch:
             print("Training model from scratch...")
-            model_scratch, losses_scratch, val_losses_scratch = train_model(
+            model_scratch, losses_scratch, val_scores_scratch = train_model(
                 args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
             print("Training model with pre-trained weights...")
-            model_pretrained, losses_pretrained, val_losses_pretrained = train_model(
+            model_pretrained, losses_pretrained, val_scores_pretrained = train_model(
                 args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size)
 
-            # Compare training losses if both models were trained
+            # Compare training metrics if both models were trained
             if not args.skip_scratch:
                 plt.figure(figsize=(12, 6))
+
                 plt.subplot(1, 2, 1)
                 plt.plot(losses_scratch, label='From Scratch')
                 plt.plot(losses_pretrained, label='Pre-trained')
@@ -530,26 +755,39 @@ if __name__ == "__main__":
                 plt.legend()
 
                 plt.subplot(1, 2, 2)
-                plt.plot(val_losses_scratch, label='From Scratch')
-                plt.plot(val_losses_pretrained, label='Pre-trained')
-                plt.title('Validation Loss Comparison')
+                plt.plot(val_scores_scratch, label='From Scratch')
+                plt.plot(val_scores_pretrained, label='Pre-trained')
+                plt.title('Validation mAP Comparison')
                 plt.xlabel('Epoch')
-                plt.ylabel('Loss')
+                plt.ylabel('mAP@0.5')
                 plt.legend()
 
-                plt.savefig(os.path.join(args.dataset_path, 'loss_comparison.png'))
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.dataset_path, 'training_comparison.png'))
+                plt.close()
 
     # Evaluate model
-    print("Evaluating pre-trained model...")
+    print("Evaluating model...")
     # Load model
     model = fasterrcnn_resnet50_fpn(num_classes=len(TARGET_CLASSES) + 1)
     model_path = os.path.join(args.dataset_path, 'faster_rcnn_model.pth')
+    best_model_path = os.path.join(args.dataset_path, 'best_faster_rcnn_model.pth')
 
-    if os.path.exists(model_path):
+    # Try loading best model first, fall back to final model
+    if os.path.exists(best_model_path):
+        print(f"Loading best model from: {best_model_path}")
+        model.load_state_dict(torch.load(best_model_path))
+    elif os.path.exists(model_path):
+        print(f"Loading model from: {model_path}")
         model.load_state_dict(torch.load(model_path))
-        results = evaluate_model(model, args.dataset_path)
-        visualize_results(results, args.dataset_path)
     else:
-        print(f"Model file not found: {model_path}")
+        print(f"Model file not found. Please train the model first.")
         if args.eval_only:
-            print("Please train the model first or provide a valid model path.")
+            exit(1)
+
+    # Run evaluation if model is loaded
+    results, metrics = evaluate_model(model, args.dataset_path, confidence_threshold=args.confidence)
+    visualize_results(results, args.dataset_path, metrics)
+
+    print("Evaluation complete!")
+    print(f"Results saved to: {os.path.join(args.dataset_path, 'results')}")
