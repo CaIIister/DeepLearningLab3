@@ -198,7 +198,7 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
         class_preds = []
         class_targets = []
 
-        for pred, target in zip(predictions, targets):
+        for i, (pred, target) in enumerate(zip(predictions, targets)):
             # Get predictions for this class
             pred_indices = (pred['labels'] == class_id).nonzero(as_tuple=True)[0]
             pred_boxes = pred['boxes'][pred_indices]
@@ -209,11 +209,12 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
             target_boxes = target['boxes'][target_indices]
 
             # Store predictions with scores and ground truths
+            # Use image index i instead of relying on 'image_id'
             for box, score in zip(pred_boxes, pred_scores):
-                class_preds.append((box, score))
+                class_preds.append((box, score, i))
 
             for box in target_boxes:
-                class_targets.append((box, pred['image_id']))
+                class_targets.append((box, i))
 
         # Skip if no predictions or targets for this class
         if not class_preds or not class_targets:
@@ -228,14 +229,18 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
         gt_covered = set()
 
         # For each prediction, check if it's a true positive
-        for i, (pred_box, _) in enumerate(class_preds):
+        for i, (pred_box, _, img_idx) in enumerate(class_preds):
             # Find the best matching ground truth
             best_iou = 0
             best_gt_idx = -1
 
-            for j, (gt_box, img_id) in enumerate(class_targets):
+            for j, (gt_box, gt_img_idx) in enumerate(class_targets):
+                # Only compare boxes from the same image
+                if img_idx != gt_img_idx:
+                    continue
+
                 # Skip already covered ground truths
-                if (img_id.item(), j) in gt_covered:
+                if (gt_img_idx, j) in gt_covered:
                     continue
 
                 # Calculate IoU
@@ -249,7 +254,7 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
             # Check if we found a match
             if best_gt_idx >= 0:
                 tp[i] = 1
-                gt_covered.add((class_targets[best_gt_idx][1].item(), best_gt_idx))
+                gt_covered.add((class_targets[best_gt_idx][1], best_gt_idx))
             else:
                 fp[i] = 1
 
