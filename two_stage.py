@@ -121,11 +121,28 @@ def get_transform():
     return torchvision.transforms.Compose(transforms)
 
 
+# Custom head for the model
+class FastRCNNPredictor(torch.nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super(FastRCNNPredictor, self).__init__()
+        self.cls_score = torch.nn.Linear(in_channels, num_classes)
+        self.bbox_pred = torch.nn.Linear(in_channels, num_classes * 4)
+
+    def forward(self, x):
+        if x.dim() == 4:
+            assert list(x.shape[2:]) == [1, 1]
+        x = x.flatten(start_dim=1)
+        scores = self.cls_score(x)
+        bbox_deltas = self.bbox_pred(x)
+
+        return scores, bbox_deltas
+
+
+# SIMPLIFIED TRAINING FUNCTION
 def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
-
 
     # Create dataset and dataloader
     dataset = CustomVOCDataset(dataset_path, get_transform())
@@ -150,7 +167,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     print(f"Training set: {len(dataset_train)} images")
     print(f"Validation set: {len(dataset_val)} images")
 
-    # Dataloaders - FIXED by using a named function instead of lambda
+    # Dataloaders
     data_loader_train = DataLoader(
         dataset_train,
         batch_size=2,
@@ -161,7 +178,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
 
     data_loader_val = DataLoader(
         dataset_val,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
@@ -208,69 +225,89 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
         # Training
         model.train()
         epoch_loss = 0
+        num_batches = 0
 
         for images, targets in tqdm(data_loader_train):
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Forward pass
+            # SIMPLIFIED APPROACH: Use a direct loss approach
+            optimizer.zero_grad()
+
+            # Forward pass with direct loss calculation
             loss_dict = model(images, targets)
 
-            # FIXED: Handle both list and dictionary return types
+            # Instead of trying to sum the losses, just use a hard-coded approach
+            # that will work for both dictionary and list returns
+            total_loss = torch.tensor(0.0, device=device)
+
+            # Handle various return types from the model
             if isinstance(loss_dict, dict):
-                losses = sum(loss for loss in loss_dict.values())
+                for loss_value in loss_dict.values():
+                    if isinstance(loss_value, torch.Tensor):
+                        total_loss += loss_value
             elif isinstance(loss_dict, list):
-                # Handle list of losses carefully
-                total_loss = 0
-                for loss in loss_dict:
-                    if isinstance(loss, dict):
-                        # If an element is a dictionary, sum its values
-                        total_loss += sum(v for v in loss.values())
-                    else:
-                        # If it's a number or tensor, add it directly
-                        total_loss += loss
-                losses = total_loss
-            else:
-                # If it's a single loss value
-                losses = loss_dict
+                for loss_item in loss_dict:
+                    if isinstance(loss_item, torch.Tensor):
+                        total_loss += loss_item
+                    elif isinstance(loss_item, dict):
+                        for loss_value in loss_item.values():
+                            if isinstance(loss_value, torch.Tensor):
+                                total_loss += loss_value
+            elif isinstance(loss_dict, torch.Tensor):
+                total_loss = loss_dict
 
             # Backward pass
-            optimizer.zero_grad()
-            losses.backward()
+            total_loss.backward()
             optimizer.step()
 
-            epoch_loss += losses.item()
+            epoch_loss += total_loss.item()
+            num_batches += 1
 
         # Update learning rate
         lr_scheduler.step()
 
         # Calculate average loss
-        avg_train_loss = epoch_loss / len(data_loader_train)
+        avg_train_loss = epoch_loss / max(1, num_batches)
         train_losses.append(avg_train_loss)
 
         # Validation
         model.eval()
         val_loss = 0
+        num_val_batches = 0
 
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
                 images = list(image.to(device) for image in images)
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                # Forward pass
+                # Forward pass with direct loss calculation
                 loss_dict = model(images, targets)
 
-                # FIXED: Handle both list and dictionary return types
-                if isinstance(loss_dict, dict):
-                    losses = sum(loss for loss in loss_dict.values())
-                else:
-                    # If it's a list or tensor, sum directly
-                    losses = sum(loss_dict) if isinstance(loss_dict, list) else loss_dict
+                # Use the same approach for validation
+                total_loss = torch.tensor(0.0, device=device)
 
-                val_loss += losses.item()
+                # Handle various return types from the model
+                if isinstance(loss_dict, dict):
+                    for loss_value in loss_dict.values():
+                        if isinstance(loss_value, torch.Tensor):
+                            total_loss += loss_value
+                elif isinstance(loss_dict, list):
+                    for loss_item in loss_dict:
+                        if isinstance(loss_item, torch.Tensor):
+                            total_loss += loss_item
+                        elif isinstance(loss_item, dict):
+                            for loss_value in loss_item.values():
+                                if isinstance(loss_value, torch.Tensor):
+                                    total_loss += loss_value
+                elif isinstance(loss_dict, torch.Tensor):
+                    total_loss = loss_dict
+
+                val_loss += total_loss.item()
+                num_val_batches += 1
 
         # Calculate average validation loss
-        avg_val_loss = val_loss / len(data_loader_val)
+        avg_val_loss = val_loss / max(1, num_val_batches)
         val_losses.append(avg_val_loss)
 
         print(f"Train Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
@@ -292,23 +329,6 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     plt.savefig(os.path.join(dataset_path, 'training_loss.png'))
 
     return model, train_losses, val_losses
-
-
-# Custom head for the model
-class FastRCNNPredictor(torch.nn.Module):
-    def __init__(self, in_channels, num_classes):
-        super(FastRCNNPredictor, self).__init__()
-        self.cls_score = torch.nn.Linear(in_channels, num_classes)
-        self.bbox_pred = torch.nn.Linear(in_channels, num_classes * 4)
-
-    def forward(self, x):
-        if x.dim() == 4:
-            assert list(x.shape[2:]) == [1, 1]
-        x = x.flatten(start_dim=1)
-        scores = self.cls_score(x)
-        bbox_deltas = self.bbox_pred(x)
-
-        return scores, bbox_deltas
 
 
 def evaluate_model(model, dataset_path, num_samples=5):
@@ -398,11 +418,11 @@ def parse_args():
     parser.add_argument('--dataset_path', type=str, default='dataset_E4888', help='Path to the dataset')
     parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
+    parser.add_argument('--subset_size', type=float, default=1.0,
+                        help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     parser.add_argument('--skip_scratch', action='store_true', help='Skip training from scratch')
     parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with pretrained weights')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
-    parser.add_argument('--subset_size', type=float, default=1.0,
-                        help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     return parser.parse_args()
 
 
