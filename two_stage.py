@@ -153,7 +153,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     # Dataloaders - FIXED by using a named function instead of lambda
     data_loader_train = DataLoader(
         dataset_train,
-        batch_size=8,
+        batch_size=4,
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
