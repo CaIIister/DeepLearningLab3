@@ -121,14 +121,24 @@ def get_transform():
     return torchvision.transforms.Compose(transforms)
 
 
-def train_model(dataset_path, use_pretrained=True, num_epochs=5):
+def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
+
     # Create dataset and dataloader
     dataset = CustomVOCDataset(dataset_path, get_transform())
-    print(f"Dataset size: {len(dataset)} images")
+    full_size = len(dataset)
+    print(f"Full dataset size: {full_size} images")
+
+    # Apply subset size if less than 1.0
+    if subset_size < 1.0:
+        subset_size = max(0.01, min(1.0, subset_size))  # Ensure it's between 0.01 and 1.0
+        reduced_size = int(full_size * subset_size)
+        indices = torch.randperm(full_size)[:reduced_size].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
+        print(f"Using {subset_size:.0%} of dataset: {len(dataset)} images")
 
     # Split dataset into train and validation (80/20 split)
     train_size = int(0.8 * len(dataset))
@@ -380,6 +390,8 @@ def parse_args():
     parser.add_argument('--skip_scratch', action='store_true', help='Skip training from scratch')
     parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with pretrained weights')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
+    parser.add_argument('--subset_size', type=float, default=1.0,
+                        help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     return parser.parse_args()
 
 
@@ -397,13 +409,13 @@ if __name__ == "__main__":
         if not args.skip_scratch:
             print("Training model from scratch...")
             model_scratch, losses_scratch, val_losses_scratch = train_model(
-                args.dataset_path, use_pretrained=False, num_epochs=args.epochs)
+                args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
             print("Training model with pre-trained weights...")
             model_pretrained, losses_pretrained, val_losses_pretrained = train_model(
-                args.dataset_path, use_pretrained=True, num_epochs=args.epochs)
+                args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size)
 
             # Compare training losses if both models were trained
             if not args.skip_scratch:
