@@ -145,9 +145,16 @@ def extract_scalar_loss(loss_tensor):
 
     # If it's already a scalar tensor (0-dim), return it directly
     if loss_tensor.dim() == 0:
+        # Convert to float if it's a Long tensor
+        if loss_tensor.dtype == torch.long or loss_tensor.dtype == torch.int64:
+            return loss_tensor.float()
         return loss_tensor
 
     # Otherwise, take the mean to reduce it to a scalar
+    # Convert to float first if it's a Long tensor
+    if loss_tensor.dtype == torch.long or loss_tensor.dtype == torch.int64:
+        loss_tensor = loss_tensor.float()
+
     return loss_tensor.mean()
 
 
