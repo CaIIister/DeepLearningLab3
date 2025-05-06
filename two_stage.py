@@ -282,7 +282,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     print(f"Using device: {device}")
 
     # Create dataset
-    dataset = CustomVOCDataset(dataset_path, transforms=None, train=True)
+    dataset = CustomVOCDataset(dataset_path, transforms=get_transform(train=True), train=True)
     full_size = len(dataset)
     print(f"Full dataset size: {full_size} images")
 
@@ -374,7 +374,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
             batch_count += 1
 
             # Move data to device
-            images = list(image.to(device) for image in images)
+            images = list(image.to(device) if isinstance(image, torch.Tensor) else get_transform()(image).to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             # Skip batches with no boxes
