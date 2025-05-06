@@ -282,9 +282,9 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5, subset_size=1.0
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
 
-    # Learning rate scheduler - using ReduceLROnPlateau instead of StepLR
+    # Learning rate scheduler - using ReduceLROnPlateau without the verbose parameter
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.1, patience=2, verbose=True
+        optimizer, mode='min', factor=0.1, patience=2
     )
 
     # Training loop
