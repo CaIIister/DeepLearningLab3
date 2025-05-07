@@ -323,7 +323,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     # Dataloaders
     data_loader_train = DataLoader(
         dataset_train,
-        batch_size=4,
+        batch_size=2,
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
@@ -331,7 +331,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     data_loader_val = DataLoader(
         dataset_val,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
