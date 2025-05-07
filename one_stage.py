@@ -66,6 +66,31 @@ class VOCInstanceSegmentationDataset(Dataset):
 
         print(f"Loaded {len(self.images)} images with {', '.join(TARGET_CLASSES)}")
 
+        # Count class instances for class balancing
+        self.class_counts = self._count_class_instances()
+
+    def _count_class_instances(self):
+        """Count instances of each class for class balancing"""
+        class_counts = {cls: 0 for cls in TARGET_CLASSES}
+
+        for ann_path in self.annotations:
+            tree = ET.parse(ann_path)
+            root = tree.getroot()
+
+            for obj in root.findall('object'):
+                class_name = obj.find('name').text
+                if class_name in TARGET_CLASSES:
+                    class_counts[class_name] += 1
+
+        # Print class distribution
+        total = sum(class_counts.values())
+        print("Class distribution:")
+        for cls, count in class_counts.items():
+            percentage = (count / total * 100) if total > 0 else 0
+            print(f"  - {cls}: {count} instances ({percentage:.1f}%)")
+
+        return class_counts
+
     def _has_target_classes(self, ann_path):
         """Check if annotation contains target classes"""
         tree = ET.parse(ann_path)
@@ -78,15 +103,31 @@ class VOCInstanceSegmentationDataset(Dataset):
         return False
 
     def _create_segmentation_mask(self, img_path, ann_path, seg_path):
-        """Create segmentation masks from bounding boxes"""
+        """Create better segmentation masks using GrabCut algorithm where possible"""
         # Load image to get dimensions
-        img = Image.open(img_path)
-        width, height = img.size
+        img = cv2.imread(img_path)
+        if img is None:  # Fall back to PIL if OpenCV fails
+            pil_img = Image.open(img_path)
+            width, height = pil_img.size
+            mask = np.zeros((height, width), dtype=np.uint8)
+            # Parse annotation for simple rectangular masks
+            self._create_simple_mask(ann_path, mask, width, height)
+        else:
+            # Create empty mask image
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+            # Try to use GrabCut for better masks
+            try:
+                self._create_grabcut_mask(img, ann_path, mask)
+            except Exception as e:
+                print(f"GrabCut failed: {e}, falling back to simple masks")
+                height, width = mask.shape
+                self._create_simple_mask(ann_path, mask, width, height)
 
-        # Create empty mask image
-        mask = np.zeros((height, width), dtype=np.uint8)
+        # Save mask
+        cv2.imwrite(seg_path, mask)
 
-        # Parse annotation
+    def _create_simple_mask(self, ann_path, mask, width, height):
+        """Create simple rectangular masks from bounding boxes"""
         tree = ET.parse(ann_path)
         root = tree.getroot()
 
@@ -106,15 +147,54 @@ class VOCInstanceSegmentationDataset(Dataset):
                 if xmin >= xmax or ymin >= ymax:
                     continue
 
-                # Create simple mask from bounding box (rectangular mask)
-                # In a real implementation, you would use actual segmentation masks from dataset
+                # Create mask from bounding box
                 mask[ymin:ymax, xmin:xmax] = class_id
-
-                # Increment instance ID
                 class_id += 1
 
-        # Save mask
-        cv2.imwrite(seg_path, mask)
+    def _create_grabcut_mask(self, img, ann_path, mask):
+        """Create segmentation masks using GrabCut algorithm"""
+        tree = ET.parse(ann_path)
+        root = tree.getroot()
+
+        class_id = 1  # Start from 1 for instance segmentation
+
+        for obj in root.findall('object'):
+            class_name = obj.find('name').text
+            if class_name in TARGET_CLASSES:
+                # Get bounding box
+                bbox = obj.find('bndbox')
+                xmin = max(0, int(float(bbox.find('xmin').text)))
+                ymin = max(0, int(float(bbox.find('ymin').text)))
+                xmax = min(img.shape[1], int(float(bbox.find('xmax').text)))
+                ymax = min(img.shape[0], int(float(bbox.find('ymax').text)))
+
+                # Skip invalid boxes
+                if xmin >= xmax or ymin >= ymax or (xmax - xmin) < 10 or (ymax - ymin) < 10:
+                    # If box is too small, use simple rectangle
+                    mask[ymin:ymax, xmin:xmax] = class_id
+                else:
+                    # Create rectangle for GrabCut
+                    rect = (xmin, ymin, xmax - xmin, ymax - ymin)
+
+                    # Prepare temporary mask and models
+                    grabcut_mask = np.zeros(img.shape[:2], np.uint8)
+                    bgd_model = np.zeros((1, 65), np.float64)
+                    fgd_model = np.zeros((1, 65), np.float64)
+
+                    # Initialize mask for GrabCut
+                    grabcut_mask[ymin:ymax, xmin:xmax] = cv2.GC_PR_FGD  # Probable foreground
+
+                    # Apply GrabCut, limit iterations to prevent slowdown
+                    cv2.grabCut(img, grabcut_mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
+
+                    # Extract segmentation by marking probable/definite foreground as foreground
+                    foreground_mask = np.where((grabcut_mask == cv2.GC_FGD) | (grabcut_mask == cv2.GC_PR_FGD), class_id,
+                                               0)
+
+                    # Apply segmentation to main mask
+                    mask = np.maximum(mask, foreground_mask)
+
+                class_id += 1
 
     def __getitem__(self, idx):
         # Load image
@@ -128,8 +208,8 @@ class VOCInstanceSegmentationDataset(Dataset):
         mask_path = self.segmentations[idx]
         mask = Image.open(mask_path)
 
-        # Resize both image and mask to 224x224
-        target_size = (224, 224)
+        # IMPROVED: Resize to higher resolution (512x512) instead of 224x224
+        target_size = (512, 512)
         img = img.resize(target_size, Image.BILINEAR)
         mask = mask.resize(target_size, Image.NEAREST)  # Use NEAREST for masks to preserve labels
 
@@ -221,6 +301,7 @@ class VOCInstanceSegmentationDataset(Dataset):
         return img, target
 
     def apply_transforms(self, img, target):
+        # IMPROVED: Enhanced data augmentation
         # Convert to tensor first
         img = torchvision.transforms.functional.to_tensor(img)
 
@@ -238,6 +319,32 @@ class VOCInstanceSegmentationDataset(Dataset):
                 if target["masks"].shape[0] > 0:
                     target["masks"] = target["masks"].flip(-1)
 
+        # Random vertical flip (with lower probability)
+        if torch.rand(1) < 0.3:
+            img = torchvision.transforms.functional.vflip(img)
+            h, w = img.shape[-2:]
+
+            if target["boxes"].shape[0] > 0:
+                boxes = target["boxes"].clone()
+                boxes[:, [1, 3]] = h - boxes[:, [3, 1]]
+                target["boxes"] = boxes
+
+                # Flip masks
+                if target["masks"].shape[0] > 0:
+                    target["masks"] = target["masks"].flip(-2)
+
+        # Color jitter: brightness, contrast, saturation and hue
+        if torch.rand(1) < 0.8:  # Apply with high probability
+            # Create a color jitter transformer
+            color_jitter = torchvision.transforms.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.3,
+                hue=0.1
+            )
+            # Apply transformation
+            img = color_jitter(img)
+
         return img, target
 
     def __len__(self):
@@ -245,13 +352,22 @@ class VOCInstanceSegmentationDataset(Dataset):
 
 
 def get_transform(train=True):
+    """IMPROVED: Enhanced transforms with more augmentations"""
     transforms = []
     transforms.append(torchvision.transforms.ToTensor())
 
     # Additional transforms for training data
     if train:
-        transforms.append(torchvision.transforms.ColorJitter(
-            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
+        transforms.extend([
+            torchvision.transforms.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.3,
+                hue=0.1
+            ),
+            # We'll handle geometric transforms in the dataset class
+            # since we need to transform the masks and boxes too
+        ])
 
     return torchvision.transforms.Compose(transforms)
 
@@ -259,7 +375,15 @@ def get_transform(train=True):
 def get_instance_segmentation_model(num_classes, pretrained=True):
     """Get Mask R-CNN model with ResNet-50-FPN backbone"""
     # Load pre-trained model
-    model = maskrcnn_resnet50_fpn(pretrained=pretrained)
+    model = maskrcnn_resnet50_fpn(
+        pretrained=pretrained,
+        # IMPROVED: Better detection parameters
+        min_size=800,  # Increased from default
+        max_size=1333,  # Standard COCO size
+        box_detections_per_img=100,  # Increased from default
+        box_score_thresh=0.05,  # Lower threshold to detect more objects during training
+        rpn_post_nms_top_n_train=2000  # Improved RPN
+    )
 
     # Get number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -382,7 +506,7 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
         precision = cumsum_tp / (cumsum_tp + cumsum_fp)
         recall = cumsum_tp / len(class_targets)
 
-        # Calculate average precision
+        # Calculate average precision using 11-point interpolation (standard method)
         ap = 0
         for t in np.arange(0, 1.1, 0.1):
             if np.sum(recall >= t) == 0:
@@ -486,7 +610,7 @@ def calculate_metrics(predictions, targets, iou_threshold=0.5):
             class_precision = stats['tp'] / (stats['tp'] + stats['fp']) if (stats['tp'] + stats['fp']) > 0 else 0
             class_recall = stats['tp'] / (stats['tp'] + stats['fn']) if (stats['tp'] + stats['fn']) > 0 else 0
             class_f1 = 2 * (class_precision * class_recall) / (class_precision + class_recall) if (
-                                                                                                              class_precision + class_recall) > 0 else 0
+                                                                                                          class_precision + class_recall) > 0 else 0
 
             class_metrics[class_name] = {
                 'precision': class_precision,
@@ -512,11 +636,44 @@ def calculate_metrics(predictions, targets, iou_threshold=0.5):
     return metrics
 
 
+def compute_class_weights(dataset):
+    """Compute class weights for balanced loss"""
+    class_counts = dataset.class_counts if hasattr(dataset, 'class_counts') else None
+
+    if not class_counts:
+        return None
+
+    # Compute inverse frequency weights
+    total_samples = sum(class_counts.values())
+    class_weights = {}
+
+    for cls, count in class_counts.items():
+        if count > 0:
+            class_weights[cls] = total_samples / (len(class_counts) * count)
+        else:
+            class_weights[cls] = 1.0
+
+    # Convert to tensor (add background class weight)
+    weights = [1.0]  # Background class weight
+    for cls in TARGET_CLASSES:
+        weights.append(class_weights[cls])
+
+    return torch.tensor(weights)
+
+
 def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0,
-                early_stopping_patience=3, accumulation_steps=4, batch_size=2):
+                early_stopping_patience=7, accumulation_steps=4, batch_size=2):
+    """IMPROVED: Enhanced training procedure with better hyperparameters and mixed precision"""
+
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
+
+    # Enable mixed precision training for better memory usage and speed
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+
+    # Enable cuDNN benchmarking for better performance with fixed input sizes
+    torch.backends.cudnn.benchmark = True
 
     # Choose model type name for clear identification
     model_type = "transfer" if use_pretrained else "scratch"
@@ -528,6 +685,8 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     print(f"Model will be saved as:")
     print(f"  - Best model: {best_model_path}")
     print(f"  - Final model: {final_model_path}")
+    print(f"Using batch size: {batch_size} with gradient accumulation steps: {accumulation_steps}")
+    print(f"Effective batch size: {batch_size * accumulation_steps}")
 
     # Create dataset
     dataset = VOCInstanceSegmentationDataset(dataset_path, transforms=get_transform(train=True), train=True)
@@ -558,15 +717,17 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         batch_size=batch_size,  # Use batch_size parameter
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=True  # Improved data loading
     )
 
     data_loader_val = DataLoader(
         dataset_val,
-        batch_size=1,
+        batch_size=1,  # Use batch size 1 for validation to conserve memory
         shuffle=False,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        pin_memory=True
     )
 
     # Create model
@@ -574,18 +735,53 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     # Get model
     model = get_instance_segmentation_model(num_classes, pretrained=use_pretrained)
-    print(f"{'Loading pre-trained' if use_pretrained else 'Training from scratch'} Mask R-CNN model...")
+
+    # IMPROVED: Implement backbone freezing for transfer learning
+    if use_pretrained:
+        print("Using transfer learning with backbone freezing...")
+        # Freeze backbone layers for initial training
+        for name, param in model.backbone.named_parameters():
+            param.requires_grad = False
+    else:
+        print("Training from scratch...")
 
     # Move model to device
     model.to(device)
 
-    # Optimizer with reduced learning rate for stability
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
+    # Compute class weights for balanced loss
+    if hasattr(dataset, 'class_counts'):
+        class_weights = compute_class_weights(dataset)
+        if class_weights is not None:
+            print("Using class weights for balanced loss:")
+            for i, weight in enumerate(class_weights):
+                class_name = "background" if i == 0 else TARGET_CLASSES[i - 1]
+                print(f"  - {class_name}: {weight.item():.4f}")
+            class_weights = class_weights.to(device)
+    else:
+        class_weights = None
+        print("Class weights not available, using unweighted loss")
 
-    # Learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2
+    # IMPROVED: Better optimizer based on training approach
+    if use_pretrained:
+        # For transfer learning: AdamW with lower learning rate
+        print("Using AdamW optimizer for transfer learning")
+        optimizer = torch.optim.AdamW([
+            {'params': [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
+            {'params': [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
+             'lr': 0.00001}  # Much lower LR for backbone if unfrozen
+        ], lr=0.0001, weight_decay=1e-5)
+    else:
+        # For training from scratch: SGD with higher learning rate
+        print("Using SGD optimizer for training from scratch")
+        optimizer = torch.optim.SGD(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=0.005, momentum=0.9, weight_decay=0.0001
+        )
+
+    # IMPROVED: Learning rate scheduler - Cosine Annealing
+    print("Using CosineAnnealingLR scheduler")
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
     )
 
     # Training loop
@@ -599,64 +795,147 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     val_maps = []
     best_map = 0.0
     patience_counter = 0
+    unfreeze_epoch = 3  # Epoch to unfreeze backbone in transfer learning
+
+    # Zero gradients before the loop
+    optimizer.zero_grad()
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
+        # Unfreeze backbone after a few epochs in transfer learning mode
+        if use_pretrained and epoch == unfreeze_epoch:
+            print(f"Unfreezing backbone layers for fine-tuning at epoch {epoch + 1}")
+            for name, param in model.backbone.named_parameters():
+                param.requires_grad = True
+
+            # Update optimizer after unfreezing backbone
+            optimizer = torch.optim.AdamW([
+                {'params': [p for n, p in model.named_parameters() if "backbone" not in n]},
+                {'params': [p for n, p in model.named_parameters() if "backbone" in n],
+                 'lr': 0.00001}  # Lower LR for backbone
+            ], lr=0.00005, weight_decay=1e-5)
+
+            # Reset scheduler
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=num_epochs - epoch, eta_min=1e-6
+            )
 
         # Training phase
         model.train()
         running_loss = 0.0
         batch_count = 0
 
-        # Zero gradients before the loop
-        optimizer.zero_grad()
-
+        # Training loop with progress bar
         for i, (images, targets) in enumerate(tqdm(data_loader_train)):
             batch_count += 1
 
-            # Process images one by one to save memory
-            loss_value = 0.0
-
+            # Process images with safety mechanisms
             try:
-                # Process one image at a time
-                for img_idx in range(len(images)):
-                    single_img = [images[img_idx]]
-                    single_target = [targets[img_idx]]
+                # Process one image at a time to save memory
+                loss_value = 0.0
 
+                # Process images in batches or individually based on memory constraints
+                try:
                     # Move to device
-                    single_img = [img.to(device) if isinstance(img, torch.Tensor)
-                                  else get_transform()(img).to(device) for img in single_img]
-                    single_target = [{k: v.to(device) for k, v in t.items()} for t in single_target]
+                    images = [img.to(device) if isinstance(img, torch.Tensor)
+                              else get_transform()(img).to(device) for img in images]
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                    # Skip if no boxes
-                    if any(len(t['boxes']) == 0 for t in single_target):
+                    # Skip if no valid boxes in batch
+                    if any(len(t['boxes']) == 0 for t in targets):
                         continue
 
-                    # Forward pass
-                    loss_dict = model(single_img, single_target)
+                    # Mixed precision forward pass
+                    with torch.cuda.amp.autocast(enabled=scaler is not None):
+                        # Forward pass
+                        loss_dict = model(images, targets)
 
-                    # Calculate loss and normalize by accumulation steps and batch size
-                    losses = sum(loss for loss in loss_dict.values()) / accumulation_steps / len(images)
+                        # Apply class weights if available (modify loss values)
+                        if class_weights is not None:
+                            # Apply only to classification losses
+                            for k in loss_dict:
+                                if 'loss_classifier' in k:
+                                    # Get target labels
+                                    batch_labels = torch.cat([t['labels'] for t in targets])
+                                    # Apply weights to this loss component
+                                    loss_dict[k] = loss_dict[k] * torch.mean(
+                                        class_weights[batch_labels]
+                                    ) / class_weights.mean()
 
-                    # Backward
-                    losses.backward()
+                        # Calculate loss
+                        losses = sum(loss for loss in loss_dict.values()) / accumulation_steps
 
-                    # Add to loss value
-                    loss_value += losses.item() * accumulation_steps * len(images) / len(single_img)
+                    # Backward pass with scaler for mixed precision
+                    if scaler:
+                        scaler.scale(losses).backward()
+                    else:
+                        losses.backward()
+
+                    # Add to loss value (unscaled)
+                    loss_value = losses.item() * accumulation_steps
+
+                except RuntimeError as e:
+                    # Handle CUDA out of memory errors by processing one by one
+                    if "CUDA out of memory" in str(e):
+                        print("CUDA OOM error, trying to process images individually...")
+                        torch.cuda.empty_cache()
+
+                        # Process one image at a time
+                        for img_idx in range(len(images)):
+                            try:
+                                # Create batch of one
+                                single_img = [images[img_idx] if isinstance(images[img_idx], torch.Tensor)
+                                              else get_transform()(images[img_idx])]
+                                single_target = [targets[img_idx]]
+
+                                # Move to device
+                                single_img = [img.to(device) for img in single_img]
+                                single_target = [{k: v.to(device) for k, v in t.items()} for t in single_target]
+
+                                # Skip if no boxes
+                                if any(len(t['boxes']) == 0 for t in single_target):
+                                    continue
+
+                                # Forward pass with mixed precision
+                                with torch.cuda.amp.autocast(enabled=scaler is not None):
+                                    loss_dict = model(single_img, single_target)
+                                    single_loss = sum(loss for loss in loss_dict.values()) / accumulation_steps
+
+                                # Backward pass
+                                if scaler:
+                                    scaler.scale(single_loss).backward()
+                                else:
+                                    single_loss.backward()
+
+                                # Add to loss value
+                                loss_value += single_loss.item() * accumulation_steps / len(images)
+
+                            except Exception as inner_e:
+                                print(f"Error processing image {img_idx}: {inner_e}")
+                                continue
+                    else:
+                        # Re-raise if not OOM
+                        raise
 
                 # Update weights only when accumulation steps are reached
                 if (i + 1) % accumulation_steps == 0 or (i + 1) == len(data_loader_train):
-                    # Clip gradients
+                    # Clip gradients to prevent exploding gradients
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                    # Step optimizer
-                    optimizer.step()
+                    # Step with scaler for mixed precision
+                    if scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
 
                     # Zero gradients
                     optimizer.zero_grad()
 
-                    # Clear cache
-                    torch.cuda.empty_cache()
+                    # Clear cache periodically
+                    if device.type == 'cuda' and (i + 1) % 10 == 0:
+                        torch.cuda.empty_cache()
 
                 # Update running loss
                 running_loss += loss_value
@@ -664,7 +943,8 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
             except Exception as e:
                 print(f"Error in training batch: {e}")
                 # Clear cache
-                torch.cuda.empty_cache()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 continue
 
         # Calculate average training loss
@@ -672,22 +952,39 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         train_losses.append(epoch_loss)
         print(f"Training Loss: {epoch_loss:.4f}")
 
+        # Update learning rate
+        lr_scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current learning rate: {current_lr:.6f}")
+
         # Validation phase
         model.eval()
         all_predictions = []
         all_targets = []
 
+        # Disable gradients for validation
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
-                images = list(image.to(device) if isinstance(image, torch.Tensor)
-                              else get_transform(train=False)(image).to(device) for image in images)
+                try:
+                    # Move data to device
+                    images = [img.to(device) if isinstance(img, torch.Tensor)
+                              else get_transform(train=False)(img).to(device) for img in images]
 
-                # Run model
-                outputs = model(images)
+                    # Forward pass with mixed precision
+                    with torch.cuda.amp.autocast(enabled=scaler is not None):
+                        # Run model in inference mode
+                        outputs = model(images)
 
-                # Store predictions and targets for metrics calculation
-                all_predictions.extend([{k: v.cpu() for k, v in t.items()} for t in outputs])
-                all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
+                    # Store predictions and targets for metrics calculation
+                    all_predictions.extend([{k: v.cpu() for k, v in t.items()} for t in outputs])
+                    all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
+
+                except Exception as e:
+                    print(f"Error in validation batch: {e}")
+                    # Clear cache
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    continue
 
         # Calculate metrics
         val_metrics = calculate_metrics(all_predictions, all_targets)
@@ -707,9 +1004,6 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
             print(
                 f"  {class_name}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, F1={metrics['f1']:.4f}")
 
-        # Update learning rate scheduler
-        lr_scheduler.step(1.0 - val_map)  # Use inverted mAP as "loss" to minimize
-
         # Check for improvement
         if val_map > best_map:
             best_map = val_map
@@ -721,7 +1015,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
             patience_counter += 1
             print(f"No improvement for {patience_counter} epochs. Best mAP: {best_map:.4f}")
 
-        # Early stopping
+        # Early stopping with increased patience
         if patience_counter >= early_stopping_patience:
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
@@ -762,7 +1056,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
 
 def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5):
-    """Evaluate model on sample images from the dataset"""
+    """IMPROVED: Enhanced evaluation with better visualization and metrics"""
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model.to(device)
     model.eval()
@@ -770,72 +1064,103 @@ def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5)
     # Create dataset
     dataset = VOCInstanceSegmentationDataset(dataset_path, transforms=get_transform(train=False), train=False)
 
-    # Get sample indices
-    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+    # Get sample indices - either random or evenly distributed
+    # Use evenly distributed samples for consistent evaluation
+    indices = []
+    step = len(dataset) // num_samples
+    for i in range(0, len(dataset), step):
+        if len(indices) < num_samples:
+            indices.append(i)
+
+    # If we don't have enough, add random ones
+    if len(indices) < num_samples:
+        additional = torch.randperm(len(dataset))
+        for idx in additional:
+            if len(indices) >= num_samples:
+                break
+            if idx.item() not in indices:
+                indices.append(idx.item())
 
     results = []
     all_predictions = []
     all_targets = []
 
-    for idx in indices:
-        # Get image and target
-        img, target = dataset[idx]
+    # Enable mixed precision for evaluation
+    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        for idx in indices:
+            try:
+                # Get image and target
+                img, target = dataset[idx]
 
-        # Make prediction
-        with torch.no_grad():
-            img_tensor = img if isinstance(img, torch.Tensor) else get_transform(train=False)(img)
-            prediction = model([img_tensor.to(device)])[0]
+                # Make prediction
+                with torch.no_grad():
+                    img_tensor = img if isinstance(img, torch.Tensor) else get_transform(train=False)(img)
+                    prediction = model([img_tensor.to(device)])[0]
 
-        # Convert to CPU
-        prediction = {k: v.cpu() for k, v in prediction.items()}
+                # Convert to CPU
+                prediction = {k: v.cpu() for k, v in prediction.items()}
 
-        # Convert image for visualization
-        img_numpy = img.permute(1, 2, 0).cpu().numpy() if isinstance(img, torch.Tensor) else np.array(img)
+                # Convert image for visualization - properly normalize
+                if isinstance(img, torch.Tensor):
+                    img_numpy = img.permute(1, 2, 0).cpu().numpy()
+                    # Ensure proper normalization for display
+                    if img_numpy.max() > 1.0:
+                        img_numpy = img_numpy / 255.0
+                else:
+                    img_numpy = np.array(img) / 255.0
 
-        # Filter predictions by confidence threshold
-        keep_indices = prediction['scores'] >= confidence_threshold
-        filtered_boxes = prediction['boxes'][keep_indices]
-        filtered_labels = prediction['labels'][keep_indices]
-        filtered_scores = prediction['scores'][keep_indices]
-        filtered_masks = prediction['masks'][keep_indices]
+                # Filter predictions by confidence threshold
+                keep_indices = prediction['scores'] >= confidence_threshold
+                filtered_boxes = prediction['boxes'][keep_indices]
+                filtered_labels = prediction['labels'][keep_indices]
+                filtered_scores = prediction['scores'][keep_indices]
+                filtered_masks = prediction['masks'][keep_indices]
 
-        # Store for metrics calculation
-        all_predictions.append(prediction)
-        all_targets.append(target)
+                # Store for metrics calculation
+                all_predictions.append(prediction)
+                all_targets.append(target)
 
-        # Calculate IoUs for each prediction with ground truth
-        ious = []
-        for pred_box, pred_label in zip(filtered_boxes, filtered_labels):
-            best_iou = 0
-            for gt_box, gt_label in zip(target['boxes'], target['labels']):
-                if pred_label == gt_label:
-                    iou = calculate_iou(pred_box, gt_box)
-                    best_iou = max(best_iou, iou)
-            ious.append(best_iou)
+                # Calculate IoUs for each prediction with ground truth
+                ious = []
+                for pred_box, pred_label in zip(filtered_boxes, filtered_labels):
+                    best_iou = 0
+                    for gt_box, gt_label in zip(target['boxes'], target['labels']):
+                        if pred_label == gt_label:
+                            iou = calculate_iou(pred_box, gt_box)
+                            best_iou = max(best_iou, iou)
+                    ious.append(best_iou)
 
-        # Calculate precision and recall for this image
-        matches = [iou >= 0.5 for iou in ious] if ious else []
-        tp = sum(matches)
-        fp = len(matches) - tp
-        fn = len(target['boxes']) - tp
+                # Calculate precision and recall for this image
+                matches = [iou >= 0.5 for iou in ious] if ious else []
+                tp = sum(matches)
+                fp = len(matches) - tp
+                fn = len(target['boxes']) - tp
 
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-        # Store result
-        results.append({
-            'image': img_numpy,
-            'pred_boxes': filtered_boxes.numpy(),
-            'pred_labels': filtered_labels.numpy(),
-            'pred_scores': filtered_scores.numpy(),
-            'pred_masks': filtered_masks.squeeze(1).numpy(),  # Remove channel dim
-            'gt_boxes': target['boxes'].numpy(),
-            'gt_labels': target['labels'].numpy(),
-            'gt_masks': target['masks'].numpy(),
-            'ious': ious,
-            'precision': precision,
-            'recall': recall
-        })
+                # Store result
+                results.append({
+                    'image': img_numpy,
+                    'pred_boxes': filtered_boxes.numpy(),
+                    'pred_labels': filtered_labels.numpy(),
+                    'pred_scores': filtered_scores.numpy(),
+                    'pred_masks': filtered_masks.squeeze(1).numpy(),  # Remove channel dim
+                    'gt_boxes': target['boxes'].numpy(),
+                    'gt_labels': target['labels'].numpy(),
+                    'gt_masks': target['masks'].numpy() if 'masks' in target else np.array([]),
+                    'ious': ious,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
+                    'image_idx': idx
+                })
+            except Exception as e:
+                print(f"Error evaluating image {idx}: {e}")
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                continue
 
     # Calculate all metrics
     metrics = calculate_metrics(all_predictions, all_targets)
@@ -857,7 +1182,7 @@ def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5)
 
 
 def visualize_segmentation_results(results, dataset_path, metrics=None):
-    """Visualize instance segmentation results"""
+    """IMPROVED: Enhanced visualization with proper normalization and metrics"""
     class_names = TARGET_CLASSES
 
     # Create results directory if it doesn't exist
@@ -871,33 +1196,41 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
     # Add metrics to title if available
     title = "Instance Segmentation Results"
     if metrics:
-        title += f" (mAP: {metrics['map']:.4f}, F1: {metrics['f1']:.4f}, Acc: {metrics['accuracy']:.4f})"
+        title += f" (mAP: {metrics['map']:.4f}, F1: {metrics['f1']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f})"
 
     plt.suptitle(title, fontsize=16)
 
     for i, result in enumerate(results):
+        # Get properly normalized image for visualization
+        img_data = result['image']
+        # Ensure proper range for matplotlib
+        if img_data.max() > 1.0:
+            img_data = img_data / 255.0
+
         # Plot ground truth
         plt.subplot(len(results), 2, 2 * i + 1)
-        plt.imshow(result['image'])
-        plt.title(f'Ground Truth (Image {i + 1})')
+        plt.imshow(img_data)
+        plt.title(f'Ground Truth (Image {i + 1}, #{result.get("image_idx", i)})')
         plt.axis('off')
 
         # Apply masks and boxes for ground truth
-        overlay = result['image'].copy()
+        overlay = img_data.copy()
         # Create a mask label image
         mask_label = np.zeros_like(overlay, dtype=np.uint8)
 
-        for j, (box, label, mask) in enumerate(zip(result['gt_boxes'], result['gt_labels'], result['gt_masks'])):
-            # Create colored mask
-            mask_color = np.array([0, 255, 0], dtype=np.uint8)  # Green for ground truth
-            mask_binary = mask > 0.5
-            for c in range(3):  # RGB channels
-                mask_label[..., c] = np.where(mask_binary, mask_color[c], mask_label[..., c])
+        for j, (box, label) in enumerate(zip(result['gt_boxes'], result['gt_labels'])):
+            # Create colored mask if available
+            if 'gt_masks' in result and j < len(result['gt_masks']):
+                mask = result['gt_masks'][j]
+                mask_color = np.array([0, 255, 0], dtype=np.uint8) / 255.0  # Green for ground truth
+                mask_binary = mask > 0.5
+                for c in range(3):  # RGB channels
+                    mask_label[..., c] = np.where(mask_binary, mask_color[c], mask_label[..., c])
 
-            # Add slight transparency
-            overlay = np.where(mask_binary[..., None],
-                               overlay * 0.7 + mask_label * 0.3,
-                               overlay)
+                # Add slight transparency
+                overlay = np.where(mask_binary[..., None],
+                                   overlay * 0.7 + mask_label * 0.3,
+                                   overlay)
 
             # Draw bounding box
             x1, y1, x2, y2 = box
@@ -911,12 +1244,12 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
 
         # Plot predictions
         plt.subplot(len(results), 2, 2 * i + 2)
-        plt.imshow(result['image'])
-        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.imshow(img_data)
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f}, F1: {result["f1"]:.2f})')
         plt.axis('off')
 
         # Apply predicted masks and boxes
-        overlay = result['image'].copy()
+        overlay = img_data.copy()
         mask_label = np.zeros_like(overlay, dtype=np.uint8)
 
         for j, (box, label, score, mask, iou) in enumerate(zip(
@@ -928,13 +1261,13 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
 
             # Color based on IoU
             if iou >= 0.7:
-                mask_color = np.array([0, 255, 0], dtype=np.uint8)  # Green for good IoU
+                mask_color = np.array([0, 255, 0], dtype=np.uint8) / 255.0  # Green for good IoU
                 edge_color = 'lime'
             elif iou >= 0.5:
-                mask_color = np.array([255, 255, 0], dtype=np.uint8)  # Yellow for medium IoU
+                mask_color = np.array([255, 255, 0], dtype=np.uint8) / 255.0  # Yellow for medium IoU
                 edge_color = 'yellow'
             else:
-                mask_color = np.array([255, 0, 0], dtype=np.uint8)  # Red for poor IoU
+                mask_color = np.array([255, 0, 0], dtype=np.uint8) / 255.0  # Red for poor IoU
                 edge_color = 'red'
 
             # Apply mask with transparency
@@ -965,24 +1298,31 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
     for i, result in enumerate(results):
         plt.figure(figsize=(12, 6))
 
+        # Get normalized image
+        img_data = result['image']
+        if img_data.max() > 1.0:
+            img_data = img_data / 255.0
+
         # Ground truth visualization
         plt.subplot(1, 2, 1)
-        plt.imshow(result['image'])
+        plt.imshow(img_data)
         plt.title('Ground Truth')
         plt.axis('off')
 
         # Apply masks with different colors for ground truth
-        overlay = result['image'].copy()
-        for j, (box, label, mask) in enumerate(zip(result['gt_boxes'], result['gt_labels'], result['gt_masks'])):
-            # Create colored mask overlay
-            color_mask = np.zeros_like(overlay, dtype=np.uint8)
-            mask_binary = mask > 0.5
-            color_mask[mask_binary] = [0, 255, 0]  # Green for ground truth
+        overlay = img_data.copy()
+        for j, (box, label) in enumerate(zip(result['gt_boxes'], result['gt_labels'])):
+            # Create colored mask if available
+            if 'gt_masks' in result and j < len(result['gt_masks']):
+                mask = result['gt_masks'][j]
+                color_mask = np.zeros_like(overlay, dtype=np.float32)
+                mask_binary = mask > 0.5
+                color_mask[mask_binary] = [0, 1.0, 0]  # Green for ground truth
 
-            # Add mask with transparency
-            overlay = np.where(mask_binary[..., None],
-                               overlay * 0.7 + color_mask * 0.3,
-                               overlay)
+                # Add mask with transparency
+                overlay = np.where(mask_binary[..., None],
+                                   overlay * 0.7 + color_mask * 0.3,
+                                   overlay)
 
             # Draw bounding box
             x1, y1, x2, y2 = box
@@ -996,12 +1336,12 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
 
         # Prediction visualization
         plt.subplot(1, 2, 2)
-        plt.imshow(result['image'])
-        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.imshow(img_data)
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f}, F1: {result["f1"]:.2f})')
         plt.axis('off')
 
         # Apply predicted masks and boxes
-        overlay = result['image'].copy()
+        overlay = img_data.copy()
         for j, (box, label, score, mask, iou) in enumerate(zip(
                 result['pred_boxes'],
                 result['pred_labels'],
@@ -1011,17 +1351,17 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
 
             # Color based on IoU
             if iou >= 0.7:
-                color = [0, 255, 0]  # Green for good IoU
+                color = [0, 1.0, 0]  # Green for good IoU
                 edge_color = 'lime'
             elif iou >= 0.5:
-                color = [255, 255, 0]  # Yellow for medium IoU
+                color = [1.0, 1.0, 0]  # Yellow for medium IoU
                 edge_color = 'yellow'
             else:
-                color = [255, 0, 0]  # Red for poor IoU
+                color = [1.0, 0, 0]  # Red for poor IoU
                 edge_color = 'red'
 
             # Apply mask with transparency
-            color_mask = np.zeros_like(overlay, dtype=np.uint8)
+            color_mask = np.zeros_like(overlay, dtype=np.float32)
             mask_binary = mask > 0.5
             color_mask[mask_binary] = color
 
@@ -1051,7 +1391,7 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
 def parse_args():
     parser = argparse.ArgumentParser(description='One-Stage Instance Segmentation using Mask R-CNN')
     parser.add_argument('--dataset_path', type=str, default='dataset_E4888', help='Path to the dataset')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=15, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
     parser.add_argument('--subset_size', type=float, default=1.0,
                         help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
