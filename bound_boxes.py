@@ -13,7 +13,7 @@ import argparse
 from one_stage import get_instance_segmentation_model, TARGET_CLASSES
 
 
-def generate_bbox_visualizations(dataset_path, num_samples=3, confidence_threshold=0.5):
+def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_threshold=0.5):
     """
     Generate bounding box visualizations comparing models trained from scratch vs transfer learning.
     Shows masks and bounding boxes for instance segmentation.
