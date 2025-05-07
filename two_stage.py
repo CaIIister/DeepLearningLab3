@@ -286,6 +286,17 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
+    # Choose model type name for clear identification
+    model_type = "transfer" if use_pretrained else "scratch"
+
+    # Define model paths with clear naming
+    best_model_path = os.path.join(dataset_path, f'best_{model_type}_model.pth')
+    final_model_path = os.path.join(dataset_path, f'final_{model_type}_model.pth')
+
+    print(f"Model will be saved as:")
+    print(f"  - Best model: {best_model_path}")
+    print(f"  - Final model: {final_model_path}")
+
     # Create dataset
     dataset = CustomVOCDataset(dataset_path, transforms=get_transform(train=True), train=True)
     full_size = len(dataset)
@@ -365,7 +376,6 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     val_maps = []
     best_map = 0.0
     patience_counter = 0
-    best_model_path = os.path.join(dataset_path, 'best_faster_rcnn_model.pth')
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
@@ -379,7 +389,8 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
             batch_count += 1
 
             # Move data to device
-            images = list(image.to(device) if isinstance(image, torch.Tensor) else get_transform()(image).to(device) for image in images)
+            images = list(image.to(device) if isinstance(image, torch.Tensor)
+                          else get_transform()(image).to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             # Skip batches with no boxes
@@ -430,7 +441,8 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
-                images = list(image.to(device) for image in images)
+                images = list(image.to(device) if isinstance(image, torch.Tensor)
+                              else get_transform(train=False)(image).to(device) for image in images)
 
                 # Run model
                 outputs = model(images)
@@ -451,7 +463,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         if val_map > best_map:
             best_map = val_map
             patience_counter = 0
-            print(f"New best mAP: {best_map:.4f} - Saving model")
+            print(f"New best mAP: {best_map:.4f} - Saving {model_type} model")
             # Save best model
             torch.save(model.state_dict(), best_model_path)
         else:
@@ -473,25 +485,26 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         model.load_state_dict(torch.load(best_model_path))
 
     # Save final model
-    torch.save(model.state_dict(), os.path.join(dataset_path, 'faster_rcnn_model.pth'))
+    print(f"Saving final {model_type} model")
+    torch.save(model.state_dict(), final_model_path)
 
     # Plot training loss and validation mAP
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
     plt.plot(train_losses)
-    plt.title('Training Loss')
+    plt.title(f'Training Loss ({model_type})')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
 
     plt.subplot(1, 2, 2)
     plt.plot(val_maps)
-    plt.title('Validation mAP@0.5')
+    plt.title(f'Validation mAP@0.5 ({model_type})')
     plt.xlabel('Epoch')
     plt.ylabel('mAP')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(dataset_path, 'training_metrics.png'))
+    plt.savefig(os.path.join(dataset_path, f'training_metrics_{model_type}.png'))
     plt.close()
 
     return model, train_losses, val_maps
@@ -504,7 +517,7 @@ def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5)
     model.eval()
 
     # Create dataset
-    dataset = CustomVOCDataset(dataset_path, transforms=get_transform(train=False))
+    dataset = CustomVOCDataset(dataset_path, transforms=get_transform(train=False), train=False)
 
     # Get sample indices, either random or deterministic depending on implementation needs
     indices = torch.randperm(len(dataset))[:num_samples].tolist()
@@ -519,13 +532,14 @@ def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5)
 
         # Make prediction
         with torch.no_grad():
-            prediction = model([img.to(device)])[0]
+            img_tensor = img if isinstance(img, torch.Tensor) else get_transform(train=False)(img)
+            prediction = model([img_tensor.to(device)])[0]
 
         # Convert tensors to CPU for processing
         prediction = {k: v.cpu() for k, v in prediction.items()}
 
         # Convert image for visualization
-        img_numpy = img.permute(1, 2, 0).cpu().numpy()
+        img_numpy = img.permute(1, 2, 0).cpu().numpy() if isinstance(img, torch.Tensor) else np.array(img)
 
         # Filter predictions by confidence threshold
         keep_indices = prediction['scores'] >= confidence_threshold
@@ -598,8 +612,9 @@ def visualize_results(results, dataset_path, metrics=None):
     class_names = TARGET_CLASSES
 
     # Create results directory if it doesn't exist
-    results_dir = os.path.join(dataset_path, 'results')
-    os.makedirs(results_dir, exist_ok=True)
+    results_dir = dataset_path
+    if not os.path.isdir(results_dir):
+        os.makedirs(results_dir, exist_ok=True)
 
     # Create a summary figure with all results
     plt.figure(figsize=(15, 5 * len(results)))
@@ -719,7 +734,7 @@ def parse_args():
     parser.add_argument('--subset_size', type=float, default=1.0,
                         help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     parser.add_argument('--skip_scratch', action='store_true', help='Skip training from scratch')
-    parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with pretrained weights')
+    parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with transfer learning')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
     parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for evaluation')
     return parser.parse_args()
@@ -733,66 +748,78 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(args.dataset_path, 'models'), exist_ok=True)
     os.makedirs(os.path.join(args.dataset_path, 'results'), exist_ok=True)
 
-    # Training and evaluation
+    # By default, train both model types unless specifically skipped
     if not args.eval_only:
         # Train model from scratch
         if not args.skip_scratch:
-            print("Training model from scratch...")
+            print("\n===== TRAINING FROM SCRATCH =====")
             model_scratch, losses_scratch, val_scores_scratch = train_model(
                 args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
-            print("Training model with pre-trained weights...")
+            print("\n===== TRAINING WITH TRANSFER LEARNING =====")
             model_pretrained, losses_pretrained, val_scores_pretrained = train_model(
                 args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size)
 
-            # Compare training metrics if both models were trained
-            if not args.skip_scratch:
-                plt.figure(figsize=(12, 6))
+        # Compare both models if both were trained
+        if not args.skip_scratch and not args.skip_pretrained:
+            print("\n===== COMPARING TRAINING APPROACHES =====")
+            plt.figure(figsize=(12, 6))
 
-                plt.subplot(1, 2, 1)
-                plt.plot(losses_scratch, label='From Scratch')
-                plt.plot(losses_pretrained, label='Pre-trained')
-                plt.title('Training Loss Comparison')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.legend()
+            plt.subplot(1, 2, 1)
+            plt.plot(losses_scratch, label='From Scratch')
+            plt.plot(losses_pretrained, label='Transfer Learning')
+            plt.title('Training Loss Comparison')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
 
-                plt.subplot(1, 2, 2)
-                plt.plot(val_scores_scratch, label='From Scratch')
-                plt.plot(val_scores_pretrained, label='Pre-trained')
-                plt.title('Validation mAP Comparison')
-                plt.xlabel('Epoch')
-                plt.ylabel('mAP@0.5')
-                plt.legend()
+            plt.subplot(1, 2, 2)
+            plt.plot(val_scores_scratch, label='From Scratch')
+            plt.plot(val_scores_pretrained, label='Transfer Learning')
+            plt.title('Validation mAP Comparison')
+            plt.xlabel('Epoch')
+            plt.ylabel('mAP@0.5')
+            plt.legend()
 
-                plt.tight_layout()
-                plt.savefig(os.path.join(args.dataset_path, 'training_comparison.png'))
-                plt.close()
+            plt.tight_layout()
+            comparison_path = os.path.join(args.dataset_path, 'training_comparison.png')
+            plt.savefig(comparison_path)
+            plt.close()
+            print(f"Training comparison saved to {comparison_path}")
 
-    # Evaluate model
-    print("Evaluating model...")
-    # Load model
-    model = fasterrcnn_resnet50_fpn(num_classes=len(TARGET_CLASSES) + 1)
-    model_path = os.path.join(args.dataset_path, 'faster_rcnn_model.pth')
-    best_model_path = os.path.join(args.dataset_path, 'best_faster_rcnn_model.pth')
+    # Evaluation - use best transfer model by default
+    if args.eval_only or not args.skip_pretrained:
+        print("\n===== EVALUATION =====")
 
-    # Try loading best model first, fall back to final model
-    if os.path.exists(best_model_path):
-        print(f"Loading best model from: {best_model_path}")
-        model.load_state_dict(torch.load(best_model_path))
-    elif os.path.exists(model_path):
-        print(f"Loading model from: {model_path}")
-        model.load_state_dict(torch.load(model_path))
-    else:
-        print(f"Model file not found. Please train the model first.")
-        if args.eval_only:
-            exit(1)
+        # Define models to evaluate
+        models_to_evaluate = []
 
-    # Run evaluation if model is loaded
-    results, metrics = evaluate_model(model, args.dataset_path, confidence_threshold=args.confidence)
-    visualize_results(results, args.dataset_path, metrics)
+        # Add transfer learning model if available
+        transfer_model_path = os.path.join(args.dataset_path, 'best_transfer_model.pth')
+        if os.path.exists(transfer_model_path):
+            models_to_evaluate.append(('transfer', transfer_model_path))
 
-    print("Evaluation complete!")
-    print(f"Results saved to: {os.path.join(args.dataset_path, 'results')}")
+        # Add scratch model if available
+        scratch_model_path = os.path.join(args.dataset_path, 'best_scratch_model.pth')
+        if os.path.exists(scratch_model_path):
+            models_to_evaluate.append(('scratch', scratch_model_path))
+
+        # Evaluate each available model
+        for model_name, model_path in models_to_evaluate:
+            print(f"\nEvaluating {model_name} model from: {model_path}")
+
+            # Load model
+            model = fasterrcnn_resnet50_fpn(num_classes=len(TARGET_CLASSES) + 1)
+            model.load_state_dict(torch.load(model_path))
+
+            # Run evaluation
+            results, metrics = evaluate_model(model, args.dataset_path, confidence_threshold=args.confidence)
+
+            # Save results with model name prefix
+            result_dir = os.path.join(args.dataset_path, f'results_{model_name}')
+            os.makedirs(result_dir, exist_ok=True)
+
+            visualize_results(results, result_dir, metrics)
+            print(f"Results saved to: {result_dir}")

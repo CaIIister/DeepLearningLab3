@@ -14,11 +14,32 @@ TARGET_CLASSES = ['diningtable', 'sofa']
 
 
 def generate_heatmap_visualizations(dataset_path, num_samples=3):
+    """
+    Generate heatmap visualizations comparing models trained from scratch vs transfer learning.
+    Only shows heatmaps without bounding boxes.
+    """
     # Paths to the trained models
-    scratch_model_path = os.path.join(dataset_path, 'faster_rcnn_model.pth')
-    transfer_model_path = os.path.join(dataset_path, 'best_faster_rcnn_model.pth')
+    scratch_model_path = os.path.join(dataset_path, 'best_scratch_model.pth')
+    transfer_model_path = os.path.join(dataset_path, 'best_transfer_model.pth')
 
-    # Create results directory if it doesn't exist
+    # Check if models exist
+    if not os.path.exists(scratch_model_path):
+        print(f"Warning: Scratch model not found at {scratch_model_path}")
+        scratch_model_path = os.path.join(dataset_path, 'final_scratch_model.pth')
+        if not os.path.exists(scratch_model_path):
+            raise FileNotFoundError(f"No scratch model found!")
+
+    if not os.path.exists(transfer_model_path):
+        print(f"Warning: Transfer model not found at {transfer_model_path}")
+        transfer_model_path = os.path.join(dataset_path, 'final_transfer_model.pth')
+        if not os.path.exists(transfer_model_path):
+            raise FileNotFoundError(f"No transfer learning model found!")
+
+    print(f"Using model files:")
+    print(f"  Scratch model: {scratch_model_path}")
+    print(f"  Transfer model: {transfer_model_path}")
+
+    # Create results directory
     results_dir = os.path.join(dataset_path, 'results', 'heatmap_comparison')
     os.makedirs(results_dir, exist_ok=True)
 
@@ -32,27 +53,36 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
     # Randomly select images
     selected_files = random.sample(img_files, num_samples)
 
-    # Load the models
+    # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    print(f"Using device: {device}")
 
-    # Load model trained from scratch
+    # Load models
+    print("Loading model trained from scratch...")
     scratch_model = fasterrcnn_resnet50_fpn(num_classes=len(TARGET_CLASSES) + 1)
     scratch_model.load_state_dict(torch.load(scratch_model_path, map_location=device))
     scratch_model.to(device)
     scratch_model.eval()
 
-    # Load transfer learning model
+    print("Loading transfer learning model...")
     transfer_model = fasterrcnn_resnet50_fpn(num_classes=len(TARGET_CLASSES) + 1)
     transfer_model.load_state_dict(torch.load(transfer_model_path, map_location=device))
     transfer_model.to(device)
     transfer_model.eval()
 
-    # Define transform for input images
-    transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
+    # Compare model parameters to verify they're different
+    scratch_params_sum = sum(p.sum().item() for p in scratch_model.parameters())
+    transfer_params_sum = sum(p.sum().item() for p in transfer_model.parameters())
+    print(f"Parameter sum check:")
+    print(f"  - Scratch model: {scratch_params_sum:.6f}")
+    print(f"  - Transfer model: {transfer_params_sum:.6f}")
+    print(f"  - Different models: {'Yes' if abs(scratch_params_sum - transfer_params_sum) > 1e-3 else 'No - WARNING!'}")
+
+    # Define transform
+    transform = transforms.Compose([transforms.ToTensor()])
 
     for i, img_file in enumerate(selected_files):
+        print(f"\nProcessing image {i + 1}/{num_samples}: {img_file}")
         img_path = os.path.join(img_dir, img_file)
         image_id = os.path.splitext(img_file)[0]
         ann_path = os.path.join(ann_dir, f"{image_id}.xml")
@@ -60,6 +90,10 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
         # Load image
         img = Image.open(img_path).convert("RGB")
         img_tensor = transform(img).unsqueeze(0).to(device)
+
+        # Convert image to numpy
+        img_np = np.array(img)
+        height, width = img_np.shape[:2]
 
         # Load ground truth annotation
         tree = ET.parse(ann_path)
@@ -80,17 +114,12 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
                 gt_boxes.append([xmin, ymin, xmax, ymax])
                 gt_labels.append(TARGET_CLASSES.index(class_name) + 1)
 
-        # Convert image to numpy for visualization
-        img_np = np.array(img)
-        height, width = img_np.shape[:2]
-
-        # Create heatmaps
+        # Get predictions from both models
         with torch.no_grad():
-            # Get predictions from both models
             scratch_preds = scratch_model(img_tensor)[0]
             transfer_preds = transfer_model(img_tensor)[0]
 
-        # Create a figure with 3 subplots
+        # Create figure for comparison
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
         # Plot original image with ground truth
@@ -104,11 +133,8 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
                          bbox=dict(facecolor='green', alpha=0.5), fontsize=8)
         axes[0].axis('off')
 
-        # Function to generate heatmap based on model predictions
-        def generate_model_heatmap(predictions, ax, title, color):
-            # Create a heatmap (confidence map)
-            heatmap = np.zeros((height, width))
-
+        # Function to generate heatmap only (no bounding boxes)
+        def generate_model_heatmap(predictions, ax, title, color_map=cv2.COLORMAP_JET):
             # Extract predictions
             boxes = predictions['boxes'].cpu().numpy()
             scores = predictions['scores'].cpu().numpy()
@@ -120,29 +146,23 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
             scores = scores[mask]
             labels = labels[mask]
 
-            # Draw base image
+            # Create a heatmap (confidence map)
+            heatmap = np.zeros((height, width))
+
+            # Draw base image first
             ax.imshow(img_np)
 
-            # Add bounding boxes and create heatmap
+            # Add to heatmap
             for box, score, label in zip(boxes, scores, labels):
-                # Draw rectangle
-                rect = plt.Rectangle((box[0], box[1]), box[2] - box[0], box[3] - box[1],
-                                     fill=False, edgecolor=color, linewidth=2)
-                ax.add_patch(rect)
-
-                # Add confidence text
-                ax.text(box[0], box[1] - 5, f"{TARGET_CLASSES[label - 1]}: {score:.2f}",
-                        bbox=dict(facecolor=color, alpha=0.5), fontsize=8)
-
-                # Add to heatmap
+                # Extract box coordinates
                 x1, y1, x2, y2 = map(int, box)
 
                 # Create gaussian blob for confidence
                 y, x = np.mgrid[0:height, 0:width]
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
-                sigma_x = (x2 - x1) / 3  # spread based on box width
-                sigma_y = (y2 - y1) / 3  # spread based on box height
+                sigma_x = max(5, (x2 - x1) / 3)  # Ensure minimum spread
+                sigma_y = max(5, (y2 - y1) / 3)  # Ensure minimum spread
 
                 # Create gaussian
                 gaussian = np.exp(-((x - center_x) ** 2 / (2 * sigma_x ** 2) +
@@ -156,17 +176,17 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
                 heatmap = heatmap / heatmap.max()
 
             # Apply heatmap as overlay
-            heatmap_colored = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            heatmap_colored = cv2.applyColorMap((heatmap * 255).astype(np.uint8), color_map)
             heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
 
             # Create a blend of original image and heatmap
-            alpha = 0.4  # transparency of heatmap
+            alpha = 0.7  # Higher alpha for more visible heatmap
             overlay = img_np.copy()
-            mask = heatmap > 0.1  # Only show areas with reasonable confidence
+            mask = heatmap > 0.01  # Very low threshold to show more gradients
             overlay[mask] = img_np[mask] * (1 - alpha) + heatmap_colored[mask] * alpha
 
-            # Display overlay
-            ax.imshow(overlay, alpha=0.6)
+            # Display overlay without bounding boxes
+            ax.imshow(overlay)
             ax.set_title(title)
             ax.axis('off')
 
@@ -174,8 +194,16 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
             return scores.mean() if len(scores) > 0 else 0
 
         # Generate heatmaps for both models
-        scratch_conf = generate_model_heatmap(scratch_preds, axes[1], 'From Scratch', 'red')
-        transfer_conf = generate_model_heatmap(transfer_preds, axes[2], 'Transfer Learning', 'blue')
+        scratch_scores = scratch_preds['scores'].cpu().numpy()
+        transfer_scores = transfer_preds['scores'].cpu().numpy()
+
+        # Apply the heatmap generation
+        scratch_conf = generate_model_heatmap(scratch_preds, axes[1], 'From Scratch')
+        transfer_conf = generate_model_heatmap(transfer_preds, axes[2], 'Transfer Learning')
+
+        # Print confidence scores for debugging
+        print(f"  Scratch model top 3 confidences: {scratch_scores[:3] if len(scratch_scores) > 0 else 'None'}")
+        print(f"  Transfer model top 3 confidences: {transfer_scores[:3] if len(transfer_scores) > 0 else 'None'}")
 
         # Update titles with average confidence
         axes[1].set_title(f'From Scratch (Avg Conf: {scratch_conf:.2f})')
@@ -186,9 +214,9 @@ def generate_heatmap_visualizations(dataset_path, num_samples=3):
         plt.savefig(os.path.join(results_dir, f'heatmap_comparison_{i + 1}.png'), dpi=200)
         plt.close()
 
-        print(f"Generated heatmap comparison {i + 1}/{num_samples}")
+        print(f"  Heatmap saved to {os.path.join(results_dir, f'heatmap_comparison_{i + 1}.png')}")
 
-    print(f"All heatmap visualizations saved to {results_dir}")
+    print(f"\nAll heatmap visualizations saved to {results_dir}")
     return results_dir
 
 
