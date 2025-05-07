@@ -398,7 +398,7 @@ def calculate_iou(box1, box2):
     return intersection / union if union > 0 else 0
 
 
-def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0, early_stopping_patience=3):
+def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0, early_stopping_patience=3, accumulation_steps=4):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
@@ -475,6 +475,8 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     # Training loop
     print("Starting training...")
+    print(
+        f"Using gradient accumulation with {accumulation_steps} steps (effective batch size: {2 * accumulation_steps})")
     start_time = time.time()
 
     # Track metrics
@@ -482,6 +484,10 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     val_maps = []
     best_map = 0.0
     patience_counter = 0
+
+
+    # Only zero out gradients once per accumulation cycle
+    optimizer.zero_grad()
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
@@ -491,7 +497,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         running_loss = 0.0
         batch_count = 0
 
-        for images, targets in tqdm(data_loader_train):
+        for i, (images, targets) in enumerate(tqdm(data_loader_train)):
             batch_count += 1
 
             # Move data to device
@@ -505,7 +511,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
                 continue
 
             # Reset gradients
-            optimizer.zero_grad()
+            #optimizer.zero_grad()
 
             try:
                 # Forward pass
@@ -513,23 +519,28 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
                 # Calculate standard loss (sum of all loss components)
                 losses = sum(loss for loss in loss_dict.values())
-                loss_value = losses.item()
 
-                # Check for valid loss
-                if not torch.isfinite(losses):
-                    print(f"Warning: Non-finite loss {loss_value}")
-                    continue
+                # Normalize loss to account for batch accumulation
+                losses = losses / accumulation_steps
 
-                # Backward pass and optimize
+                # Backward pass (accumulate gradients)
                 losses.backward()
 
-                # Add gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-
-                # Update running loss
+                # Record loss value
+                loss_value = losses.item() * accumulation_steps  # Scale back for reporting
                 running_loss += loss_value
+
+                # Update weights only after accumulation_steps
+                if (i + 1) % accumulation_steps == 0 or (i + 1) == len(data_loader_train):
+                    # Add gradient clipping to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    # Update weights
+                    optimizer.step()
+
+                    # Reset gradients
+                    optimizer.zero_grad()
+
 
             except Exception as e:
                 print(f"Error in training batch: {e}")
@@ -917,6 +928,8 @@ def parse_args():
     parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with transfer learning')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
     parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for evaluation')
+    parser.add_argument('--accumulation_steps', type=int, default=4,
+                        help='Number of gradient accumulation steps (effective batch size multiplier)')
     return parser.parse_args()
 
 
@@ -934,13 +947,13 @@ if __name__ == "__main__":
         if not args.skip_scratch:
             print("\n===== TRAINING SEGMENTATION FROM SCRATCH =====")
             model_scratch, losses_scratch, val_scores_scratch = train_model(
-                args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size)
+                args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size, accumulation_steps=4)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
             print("\n===== TRAINING SEGMENTATION WITH TRANSFER LEARNING =====")
             model_pretrained, losses_pretrained, val_scores_pretrained = train_model(
-                args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size)
+                args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size, accumulation_steps=4)
 
         # Compare both models if both were trained
         if not args.skip_scratch and not args.skip_pretrained:
