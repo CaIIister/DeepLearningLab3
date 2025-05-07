@@ -121,9 +121,19 @@ class VOCInstanceSegmentationDataset(Dataset):
         img_path = self.images[idx]
         img = Image.open(img_path).convert("RGB")
 
+        # Get original image dimensions
+        orig_width, orig_height = img.size
+
+
         # Load mask
         mask_path = self.segmentations[idx]
         mask = Image.open(mask_path)
+
+        # Resize both image and mask to 224x224
+        target_size = (224, 224)
+        img = img.resize(target_size, Image.BILINEAR)
+        mask = mask.resize(target_size, Image.NEAREST)  # Use NEAREST for masks to preserve labels
+
         mask = np.array(mask)
 
         # Get unique instance IDs
@@ -146,6 +156,10 @@ class VOCInstanceSegmentationDataset(Dataset):
         boxes = []
         labels = []
 
+        # Calculate scale factors for box coordinates
+        scale_x = target_size[0] / orig_width
+        scale_y = target_size[1] / orig_height
+
         for obj in root.findall('object'):
             class_name = obj.find('name').text
             if class_name in TARGET_CLASSES:
@@ -162,6 +176,12 @@ class VOCInstanceSegmentationDataset(Dataset):
                 # Skip invalid boxes
                 if xmin >= xmax or ymin >= ymax:
                     continue
+
+                # Scale bounding box coordinates to match the resized image
+                xmin = xmin * scale_x
+                ymin = ymin * scale_y
+                xmax = xmax * scale_x
+                ymax = ymax * scale_y
 
                 boxes.append([xmin, ymin, xmax, ymax])
                 labels.append(label)
