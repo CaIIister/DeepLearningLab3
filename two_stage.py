@@ -323,7 +323,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     # Dataloaders
     data_loader_train = DataLoader(
         dataset_train,
-        batch_size=2,
+        batch_size=4,
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
@@ -331,7 +331,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     data_loader_val = DataLoader(
         dataset_val,
-        batch_size=1,
+        batch_size=2,
         shuffle=False,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
@@ -360,7 +360,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
 
     # Optimizer with reduced learning rate for stability
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
 
     # Learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

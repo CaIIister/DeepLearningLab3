@@ -13,7 +13,7 @@ import cv2
 TARGET_CLASSES = ['diningtable', 'sofa']
 
 
-def generate_heatmap_visualizations(dataset_path, num_samples=3):
+def generate_heatmap_visualizations(dataset_path, num_samples=5):
     """
     Generate heatmap visualizations comparing models trained from scratch vs transfer learning.
     Only shows heatmaps without bounding boxes.
