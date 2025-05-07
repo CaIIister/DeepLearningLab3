@@ -16,7 +16,8 @@ import argparse
 
 # Define target classes
 TARGET_CLASSES = ['diningtable', 'sofa']
-CLASS_MAPPING = {cls: idx for idx, cls in enumerate(TARGET_CLASSES)}
+CLASS_MAPPING = {cls: idx + 1 for idx, cls in enumerate(TARGET_CLASSES)}  # +1 for background
+CLASS_MAPPING_INV = {idx: cls for cls, idx in CLASS_MAPPING.items()}
 
 
 # Custom collate function to avoid pickling issues
@@ -25,9 +26,10 @@ def collate_fn(batch):
 
 
 class VOCInstanceSegmentationDataset(Dataset):
-    def __init__(self, root, transforms=None):
+    def __init__(self, root, transforms=None, train=True):
         self.root = root
         self.transforms = transforms
+        self.train = train
 
         # Get list of images and annotations
         self.images = []
@@ -61,6 +63,8 @@ class VOCInstanceSegmentationDataset(Dataset):
                     self._create_segmentation_mask(img_path, ann_path, seg_path)
 
                 self.segmentations.append(seg_path)
+
+        print(f"Loaded {len(self.images)} images with {', '.join(TARGET_CLASSES)}")
 
     def _has_target_classes(self, ann_path):
         """Check if annotation contains target classes"""
@@ -98,6 +102,10 @@ class VOCInstanceSegmentationDataset(Dataset):
                 xmax = min(width, int(float(bbox.find('xmax').text)))
                 ymax = min(height, int(float(bbox.find('ymax').text)))
 
+                # Skip invalid boxes
+                if xmin >= xmax or ymin >= ymax:
+                    continue
+
                 # Create simple mask from bounding box (rectangular mask)
                 # In a real implementation, you would use actual segmentation masks from dataset
                 mask[ymin:ymax, xmin:xmax] = class_id
@@ -130,6 +138,10 @@ class VOCInstanceSegmentationDataset(Dataset):
         tree = ET.parse(ann_path)
         root = tree.getroot()
 
+        # Get image dimensions
+        width = int(root.find('./size/width').text)
+        height = int(root.find('./size/height').text)
+
         # Get bounding boxes and labels
         boxes = []
         labels = []
@@ -137,23 +149,35 @@ class VOCInstanceSegmentationDataset(Dataset):
         for obj in root.findall('object'):
             class_name = obj.find('name').text
             if class_name in TARGET_CLASSES:
-                # Get class index (0 or 1 for our two classes)
+                # Get class index
                 label = CLASS_MAPPING[class_name]
 
                 # Get bounding box
                 bbox = obj.find('bndbox')
-                xmin = float(bbox.find('xmin').text)
-                ymin = float(bbox.find('ymin').text)
-                xmax = float(bbox.find('xmax').text)
-                ymax = float(bbox.find('ymax').text)
+                xmin = max(0, float(bbox.find('xmin').text))
+                ymin = max(0, float(bbox.find('ymin').text))
+                xmax = min(width, float(bbox.find('xmax').text))
+                ymax = min(height, float(bbox.find('ymax').text))
+
+                # Skip invalid boxes
+                if xmin >= xmax or ymin >= ymax:
+                    continue
 
                 boxes.append([xmin, ymin, xmax, ymax])
                 labels.append(label)
 
         # Convert to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-        masks = torch.as_tensor(masks, dtype=torch.uint8)
+        if not boxes:  # Handle case with no valid boxes
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros(0, dtype=torch.int64)
+            masks = torch.zeros((0, height, width), dtype=torch.uint8)
+        else:
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.int64)
+            if len(masks) > 0:
+                masks = torch.as_tensor(masks, dtype=torch.uint8)
+            else:
+                masks = torch.zeros((0, height, width), dtype=torch.uint8)
 
         image_id = torch.tensor([idx])
         area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
@@ -169,8 +193,31 @@ class VOCInstanceSegmentationDataset(Dataset):
         target["area"] = area
         target["iscrowd"] = iscrowd
 
-        if self.transforms is not None:
+        # Apply data augmentation if training
+        if self.train and self.transforms is not None:
+            img, target = self.apply_transforms(img, target)
+        elif self.transforms is not None:
             img = self.transforms(img)
+
+        return img, target
+
+    def apply_transforms(self, img, target):
+        # Convert to tensor first
+        img = torchvision.transforms.functional.to_tensor(img)
+
+        # Apply random horizontal flip with 50% probability
+        if torch.rand(1) < 0.5:
+            img = torchvision.transforms.functional.hflip(img)
+            h, w = img.shape[-2:]
+
+            if target["boxes"].shape[0] > 0:
+                boxes = target["boxes"].clone()
+                boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
+                target["boxes"] = boxes
+
+                # Flip masks too
+                if target["masks"].shape[0] > 0:
+                    target["masks"] = target["masks"].flip(-1)
 
         return img, target
 
@@ -178,9 +225,15 @@ class VOCInstanceSegmentationDataset(Dataset):
         return len(self.images)
 
 
-def get_transform():
+def get_transform(train=True):
     transforms = []
     transforms.append(torchvision.transforms.ToTensor())
+
+    # Additional transforms for training data
+    if train:
+        transforms.append(torchvision.transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1))
+
     return torchvision.transforms.Compose(transforms)
 
 
@@ -206,14 +259,153 @@ def get_instance_segmentation_model(num_classes, pretrained=True):
     return model
 
 
-def train_model(dataset_path, use_pretrained=True, num_epochs=5):
+def calculate_map(predictions, targets, iou_threshold=0.5):
+    """Calculate mean Average Precision at specified IoU threshold"""
+    if not predictions or not targets:
+        return 0.0
+
+    # Initialize variables for mAP calculation
+    aps = []
+
+    # Process each class
+    for class_id in range(1, len(TARGET_CLASSES) + 1):
+        # Extract all predictions and ground truths for this class
+        class_preds = []
+        class_targets = []
+
+        for i, (pred, target) in enumerate(zip(predictions, targets)):
+            # Get predictions for this class
+            pred_indices = (pred['labels'] == class_id).nonzero(as_tuple=True)[0]
+            pred_boxes = pred['boxes'][pred_indices]
+            pred_scores = pred['scores'][pred_indices]
+
+            # Get ground truths for this class
+            target_indices = (target['labels'] == class_id).nonzero(as_tuple=True)[0]
+            target_boxes = target['boxes'][target_indices]
+
+            # Store predictions with scores and ground truths
+            # Use image index i instead of relying on 'image_id'
+            for box, score in zip(pred_boxes, pred_scores):
+                class_preds.append((box, score, i))
+
+            for box in target_boxes:
+                class_targets.append((box, i))
+
+        # Skip if no predictions or targets for this class
+        if not class_preds or not class_targets:
+            continue
+
+        # Sort predictions by confidence score (highest first)
+        class_preds.sort(key=lambda x: x[1], reverse=True)
+
+        # Initialize variables for precision-recall calculation
+        tp = np.zeros(len(class_preds))
+        fp = np.zeros(len(class_preds))
+        gt_covered = set()
+
+        # For each prediction, check if it's a true positive
+        for i, (pred_box, _, img_idx) in enumerate(class_preds):
+            # Find the best matching ground truth
+            best_iou = 0
+            best_gt_idx = -1
+
+            for j, (gt_box, gt_img_idx) in enumerate(class_targets):
+                # Only compare boxes from the same image
+                if img_idx != gt_img_idx:
+                    continue
+
+                # Skip already covered ground truths
+                if (gt_img_idx, j) in gt_covered:
+                    continue
+
+                # Calculate IoU
+                iou = calculate_iou(pred_box, gt_box)
+
+                # Update best match
+                if iou > best_iou and iou >= iou_threshold:
+                    best_iou = iou
+                    best_gt_idx = j
+
+            # Check if we found a match
+            if best_gt_idx >= 0:
+                tp[i] = 1
+                gt_covered.add((class_targets[best_gt_idx][1], best_gt_idx))
+            else:
+                fp[i] = 1
+
+        # Calculate cumulative sums
+        cumsum_tp = np.cumsum(tp)
+        cumsum_fp = np.cumsum(fp)
+
+        # Calculate precision and recall
+        precision = cumsum_tp / (cumsum_tp + cumsum_fp)
+        recall = cumsum_tp / len(class_targets)
+
+        # Calculate average precision
+        ap = 0
+        for t in np.arange(0, 1.1, 0.1):
+            if np.sum(recall >= t) == 0:
+                p = 0
+            else:
+                p = np.max(precision[recall >= t])
+            ap += p / 11
+
+        aps.append(ap)
+
+    # Calculate mAP
+    return np.mean(aps) if aps else 0.0
+
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two bounding boxes"""
+    # Convert to [x1, y1, x2, y2] format
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    # Calculate area of intersection
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
+    intersection = w * h
+
+    # Calculate area of union
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = box1_area + box2_area - intersection
+
+    # Return IoU
+    return intersection / union if union > 0 else 0
+
+
+def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0, early_stopping_patience=3):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
-    # Create dataset and dataloader
-    dataset = VOCInstanceSegmentationDataset(dataset_path, get_transform())
-    print(f"Dataset size: {len(dataset)} images")
+    # Choose model type name for clear identification
+    model_type = "transfer" if use_pretrained else "scratch"
+
+    # Define model paths with clear naming
+    best_model_path = os.path.join(dataset_path, f'best_{model_type}_segmentation_model.pth')
+    final_model_path = os.path.join(dataset_path, f'final_{model_type}_segmentation_model.pth')
+
+    print(f"Model will be saved as:")
+    print(f"  - Best model: {best_model_path}")
+    print(f"  - Final model: {final_model_path}")
+
+    # Create dataset
+    dataset = VOCInstanceSegmentationDataset(dataset_path, transforms=get_transform(train=True), train=True)
+    full_size = len(dataset)
+    print(f"Full dataset size: {full_size} images")
+
+    # Apply subset size if less than 1.0
+    if subset_size < 1.0:
+        subset_size = max(0.1, min(1.0, subset_size))  # Ensure it's between 0.1 and 1.0
+        reduced_size = int(full_size * subset_size)
+        indices = torch.randperm(full_size)[:reduced_size].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
+        print(f"Using {subset_size:.0%} of dataset: {len(dataset)} images")
 
     # Split dataset into train and validation (80/20 split)
     train_size = int(0.8 * len(dataset))
@@ -225,7 +417,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5):
     print(f"Training set: {len(dataset_train)} images")
     print(f"Validation set: {len(dataset_val)} images")
 
-    # Dataloaders - FIXED by using a named function instead of lambda
+    # Dataloaders
     data_loader_train = DataLoader(
         dataset_train,
         batch_size=2,
@@ -242,23 +434,24 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5):
         collate_fn=collate_fn
     )
 
-    # Create model - for our one-stage implementation, we're using Mask R-CNN
-    # While Mask R-CNN is technically two-stage, we're using it as a representative model
-    # In practice, a true one-stage instance segmentation model like YOLACT would be used
+    # Create model
     num_classes = len(TARGET_CLASSES) + 1  # +1 for background
 
     # Get model
     model = get_instance_segmentation_model(num_classes, pretrained=use_pretrained)
+    print(f"{'Loading pre-trained' if use_pretrained else 'Training from scratch'} Mask R-CNN model...")
 
     # Move model to device
     model.to(device)
 
-    # Optimizer
+    # Optimizer with reduced learning rate for stability
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
 
     # Learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2
+    )
 
     # Training loop
     print("Starting training...")
@@ -266,90 +459,158 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=5):
 
     # Track metrics
     train_losses = []
-    val_losses = []
+    val_maps = []
+    best_map = 0.0
+    patience_counter = 0
 
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        # Training
+        # Training phase
         model.train()
-        epoch_loss = 0
+        running_loss = 0.0
+        batch_count = 0
 
         for images, targets in tqdm(data_loader_train):
-            images = list(image.to(device) for image in images)
+            batch_count += 1
+
+            # Move data to device
+            images = list(image.to(device) if isinstance(image, torch.Tensor)
+                          else get_transform()(image).to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Forward pass
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            # Skip batches with no boxes
+            if any(len(t['boxes']) == 0 for t in targets):
+                print("Skipping batch with empty targets")
+                continue
 
-            # Backward pass
+            # Reset gradients
             optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
 
-            epoch_loss += losses.item()
+            try:
+                # Forward pass
+                loss_dict = model(images, targets)
 
-        # Update learning rate
-        lr_scheduler.step()
+                # Calculate standard loss (sum of all loss components)
+                losses = sum(loss for loss in loss_dict.values())
+                loss_value = losses.item()
 
-        # Calculate average loss
-        avg_train_loss = epoch_loss / len(data_loader_train)
-        train_losses.append(avg_train_loss)
+                # Check for valid loss
+                if not torch.isfinite(losses):
+                    print(f"Warning: Non-finite loss {loss_value}")
+                    continue
 
-        # Validation
+                # Backward pass and optimize
+                losses.backward()
+
+                # Add gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+
+                # Update running loss
+                running_loss += loss_value
+
+            except Exception as e:
+                print(f"Error in training batch: {e}")
+                continue
+
+        # Calculate average training loss
+        epoch_loss = running_loss / max(1, batch_count)
+        train_losses.append(epoch_loss)
+        print(f"Training Loss: {epoch_loss:.4f}")
+
+        # Validation phase
         model.eval()
-        val_loss = 0
+        all_predictions = []
+        all_targets = []
 
         with torch.no_grad():
             for images, targets in tqdm(data_loader_val):
-                images = list(image.to(device) for image in images)
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                images = list(image.to(device) if isinstance(image, torch.Tensor)
+                              else get_transform(train=False)(image).to(device) for image in images)
 
-                # Forward pass
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
+                # Run model
+                outputs = model(images)
 
-                val_loss += losses.item()
+                # Store predictions and targets for mAP calculation
+                all_predictions.extend([{k: v.cpu() for k, v in t.items()} for t in outputs])
+                all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
 
-        # Calculate average validation loss
-        avg_val_loss = val_loss / len(data_loader_val)
-        val_losses.append(avg_val_loss)
+        # Calculate mAP
+        val_map = calculate_map(all_predictions, all_targets)
+        val_maps.append(val_map)
+        print(f"Validation mAP@0.5: {val_map:.4f}")
 
-        print(f"Train Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
+        # Update learning rate scheduler
+        lr_scheduler.step(1.0 - val_map)  # Use inverted mAP as "loss" to minimize
 
+        # Check for improvement
+        if val_map > best_map:
+            best_map = val_map
+            patience_counter = 0
+            print(f"New best mAP: {best_map:.4f} - Saving {model_type} model")
+            # Save best model
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs. Best mAP: {best_map:.4f}")
+
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            print(f"Early stopping triggered after {epoch + 1} epochs")
+            break
+
+    # Training complete
     total_time = time.time() - start_time
     print(f"Training complete in {total_time / 60:.2f} minutes")
 
-    # Save model
-    torch.save(model.state_dict(), os.path.join(dataset_path, 'instance_segmentation_model.pth'))
+    # Load best model
+    if os.path.exists(best_model_path):
+        print(f"Loading best model with mAP: {best_map:.4f}")
+        model.load_state_dict(torch.load(best_model_path))
 
-    # Plot training and validation loss
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title('Training and Validation Loss')
+    # Save final model
+    print(f"Saving final {model_type} model")
+    torch.save(model.state_dict(), final_model_path)
+
+    # Plot training loss and validation mAP
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses)
+    plt.title(f'Training Loss ({model_type})')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig(os.path.join(dataset_path, 'segmentation_training_loss.png'))
 
-    return model, train_losses, val_losses
+    plt.subplot(1, 2, 2)
+    plt.plot(val_maps)
+    plt.title(f'Validation mAP@0.5 ({model_type})')
+    plt.xlabel('Epoch')
+    plt.ylabel('mAP')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(dataset_path, f'segmentation_metrics_{model_type}.png'))
+    plt.close()
+
+    return model, train_losses, val_maps
 
 
-def evaluate_model(model, dataset_path, num_samples=5):
+def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5):
     """Evaluate model on sample images from the dataset"""
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model.to(device)
     model.eval()
 
     # Create dataset
-    dataset = VOCInstanceSegmentationDataset(dataset_path, get_transform())
+    dataset = VOCInstanceSegmentationDataset(dataset_path, transforms=get_transform(train=False), train=False)
 
     # Get sample indices
     indices = torch.randperm(len(dataset))[:num_samples].tolist()
 
     results = []
+    all_predictions = []
+    all_targets = []
 
     for idx in indices:
         # Get image and target
@@ -357,103 +618,285 @@ def evaluate_model(model, dataset_path, num_samples=5):
 
         # Make prediction
         with torch.no_grad():
-            prediction = model([img.to(device)])[0]
+            img_tensor = img if isinstance(img, torch.Tensor) else get_transform(train=False)(img)
+            prediction = model([img_tensor.to(device)])[0]
 
-        # Convert image to numpy for visualization
-        img = img.permute(1, 2, 0).cpu().numpy()
+        # Convert to CPU
+        prediction = {k: v.cpu() for k, v in prediction.items()}
 
-        # Get masks, boxes, labels and scores
-        pred_masks = prediction['masks'].cpu().numpy()
-        pred_boxes = prediction['boxes'].cpu().numpy()
-        pred_labels = prediction['labels'].cpu().numpy()
-        pred_scores = prediction['scores'].cpu().numpy()
+        # Convert image for visualization
+        img_numpy = img.permute(1, 2, 0).cpu().numpy() if isinstance(img, torch.Tensor) else np.array(img)
 
-        # Get ground truth masks, boxes and labels
-        gt_masks = target['masks'].cpu().numpy()
-        gt_boxes = target['boxes'].cpu().numpy()
-        gt_labels = target['labels'].cpu().numpy()
+        # Filter predictions by confidence threshold
+        keep_indices = prediction['scores'] >= confidence_threshold
+        filtered_boxes = prediction['boxes'][keep_indices]
+        filtered_labels = prediction['labels'][keep_indices]
+        filtered_scores = prediction['scores'][keep_indices]
+        filtered_masks = prediction['masks'][keep_indices]
 
+        # Store for metrics calculation
+        all_predictions.append(prediction)
+        all_targets.append(target)
+
+        # Calculate IoUs for each prediction with ground truth
+        ious = []
+        for pred_box, pred_label in zip(filtered_boxes, filtered_labels):
+            best_iou = 0
+            for gt_box, gt_label in zip(target['boxes'], target['labels']):
+                if pred_label == gt_label:
+                    iou = calculate_iou(pred_box, gt_box)
+                    best_iou = max(best_iou, iou)
+            ious.append(best_iou)
+
+        # Calculate precision and recall for this image
+        matches = [iou >= 0.5 for iou in ious] if ious else []
+        tp = sum(matches)
+        fp = len(matches) - tp
+        fn = len(target['boxes']) - tp
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        # Store result
         results.append({
-            'image': img,
-            'pred_masks': pred_masks,
-            'pred_boxes': pred_boxes,
-            'pred_labels': pred_labels,
-            'pred_scores': pred_scores,
-            'gt_masks': gt_masks,
-            'gt_boxes': gt_boxes,
-            'gt_labels': gt_labels
+            'image': img_numpy,
+            'pred_boxes': filtered_boxes.numpy(),
+            'pred_labels': filtered_labels.numpy(),
+            'pred_scores': filtered_scores.numpy(),
+            'pred_masks': filtered_masks.squeeze(1).numpy(),  # Remove channel dim
+            'gt_boxes': target['boxes'].numpy(),
+            'gt_labels': target['labels'].numpy(),
+            'gt_masks': target['masks'].numpy(),
+            'ious': ious,
+            'precision': precision,
+            'recall': recall
         })
 
-    return results
+    # Calculate overall metrics
+    map_score = calculate_map(all_predictions, all_targets)
+
+    # Print metrics
+    print(f"Evaluation Metrics:")
+    print(f"  mAP@0.5: {map_score:.4f}")
+
+    avg_precision = np.mean([r['precision'] for r in results])
+    avg_recall = np.mean([r['recall'] for r in results])
+
+    print(f"  Average Precision: {avg_precision:.4f}")
+    print(f"  Average Recall: {avg_recall:.4f}")
+
+    metrics = {
+        'map': map_score,
+        'precision': avg_precision,
+        'recall': avg_recall
+    }
+
+    return results, metrics
 
 
-def visualize_segmentation_results(results, dataset_path):
+def visualize_segmentation_results(results, dataset_path, metrics=None):
     """Visualize instance segmentation results"""
     class_names = TARGET_CLASSES
 
+    # Create results directory if it doesn't exist
+    results_dir = dataset_path
+    if not os.path.isdir(results_dir):
+        os.makedirs(results_dir, exist_ok=True)
+
+    # Create a summary figure
+    plt.figure(figsize=(15, 5 * len(results)))
+
+    # Add metrics to title if available
+    title = "Instance Segmentation Results"
+    if metrics:
+        title += f" (mAP@0.5: {metrics['map']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f})"
+
+    plt.suptitle(title, fontsize=16)
+
     for i, result in enumerate(results):
-        plt.figure(figsize=(12, 6))
-
         # Plot ground truth
-        plt.subplot(1, 2, 1)
+        plt.subplot(len(results), 2, 2 * i + 1)
         plt.imshow(result['image'])
-        plt.title('Ground Truth')
+        plt.title(f'Ground Truth (Image {i + 1})')
+        plt.axis('off')
 
-        # Apply masks with different colors
-        img_gt = result['image'].copy()
-        for j, (mask, label) in enumerate(zip(result['gt_masks'], result['gt_labels'])):
-            color = np.array([0, 1.0, 0, 0.5])  # Green with alpha
-            mask_img = mask[0, :, :, None] * color.reshape(1, 1, 4)
-            img_gt = np.where(mask_img, mask_img, img_gt)
+        # Apply masks and boxes for ground truth
+        overlay = result['image'].copy()
+        # Create a mask label image
+        mask_label = np.zeros_like(overlay, dtype=np.uint8)
 
-            # Also draw bounding box
-            box = result['gt_boxes'][j]
+        for j, (box, label, mask) in enumerate(zip(result['gt_boxes'], result['gt_labels'], result['gt_masks'])):
+            # Create colored mask
+            mask_color = np.array([0, 255, 0], dtype=np.uint8)  # Green for ground truth
+            mask_binary = mask > 0.5
+            for c in range(3):  # RGB channels
+                mask_label[..., c] = np.where(mask_binary, mask_color[c], mask_label[..., c])
+
+            # Add slight transparency
+            overlay = np.where(mask_binary[..., None],
+                               overlay * 0.7 + mask_label * 0.3,
+                               overlay)
+
+            # Draw bounding box
             x1, y1, x2, y2 = box
             plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
                                               fill=False, edgecolor='green', linewidth=2))
-            plt.text(x1, y1, class_names[label],
-                     bbox=dict(facecolor='green', alpha=0.5))
 
-        plt.imshow(img_gt)
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, cls_name, bbox=dict(facecolor='green', alpha=0.5))
+
+        plt.imshow(overlay)
 
         # Plot predictions
+        plt.subplot(len(results), 2, 2 * i + 2)
+        plt.imshow(result['image'])
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.axis('off')
+
+        # Apply predicted masks and boxes
+        overlay = result['image'].copy()
+        mask_label = np.zeros_like(overlay, dtype=np.uint8)
+
+        for j, (box, label, score, mask, iou) in enumerate(zip(
+                result['pred_boxes'],
+                result['pred_labels'],
+                result['pred_scores'],
+                result['pred_masks'],
+                result['ious'])):
+
+            # Color based on IoU
+            if iou >= 0.7:
+                mask_color = np.array([0, 255, 0], dtype=np.uint8)  # Green for good IoU
+                edge_color = 'lime'
+            elif iou >= 0.5:
+                mask_color = np.array([255, 255, 0], dtype=np.uint8)  # Yellow for medium IoU
+                edge_color = 'yellow'
+            else:
+                mask_color = np.array([255, 0, 0], dtype=np.uint8)  # Red for poor IoU
+                edge_color = 'red'
+
+            # Apply mask with transparency
+            mask_binary = mask > 0.5
+            for c in range(3):  # RGB channels
+                mask_label[..., c] = np.where(mask_binary, mask_color[c], mask_label[..., c])
+
+            overlay = np.where(mask_binary[..., None],
+                               overlay * 0.7 + mask_label * 0.3,
+                               overlay)
+
+            # Draw bounding box
+            x1, y1, x2, y2 = box
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor=edge_color, linewidth=2))
+
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, f"{cls_name}: {score:.2f}, IoU: {iou:.2f}",
+                     bbox=dict(facecolor=edge_color, alpha=0.5))
+
+        plt.imshow(overlay)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])  # Adjust layout for the title
+    plt.savefig(os.path.join(results_dir, 'segmentation_results.png'), dpi=200)
+    plt.close()
+
+    # Also save individual result images for better detail
+    for i, result in enumerate(results):
+        plt.figure(figsize=(12, 6))
+
+        # Ground truth visualization
+        plt.subplot(1, 2, 1)
+        plt.imshow(result['image'])
+        plt.title('Ground Truth')
+        plt.axis('off')
+
+        # Apply masks with different colors for ground truth
+        overlay = result['image'].copy()
+        for j, (box, label, mask) in enumerate(zip(result['gt_boxes'], result['gt_labels'], result['gt_masks'])):
+            # Create colored mask overlay
+            color_mask = np.zeros_like(overlay, dtype=np.uint8)
+            mask_binary = mask > 0.5
+            color_mask[mask_binary] = [0, 255, 0]  # Green for ground truth
+
+            # Add mask with transparency
+            overlay = np.where(mask_binary[..., None],
+                               overlay * 0.7 + color_mask * 0.3,
+                               overlay)
+
+            # Draw bounding box
+            x1, y1, x2, y2 = box
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor='green', linewidth=2))
+
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, cls_name, bbox=dict(facecolor='green', alpha=0.5))
+
+        plt.imshow(overlay)
+
+        # Prediction visualization
         plt.subplot(1, 2, 2)
         plt.imshow(result['image'])
-        plt.title('Predictions')
+        plt.title(f'Predictions (P: {result["precision"]:.2f}, R: {result["recall"]:.2f})')
+        plt.axis('off')
 
-        # Apply masks with different colors for predictions
-        img_pred = result['image'].copy()
-        for j, (mask, label, score) in enumerate(zip(result['pred_masks'],
-                                                     result['pred_labels'],
-                                                     result['pred_scores'])):
-            if score > 0.5:  # Only show predictions with confidence > 0.5
-                color = np.array([1.0, 0, 0, 0.5])  # Red with alpha
-                # Masks have shape [N, 1, H, W]
-                mask_img = mask[0, :, :, None] * color.reshape(1, 1, 4)
-                img_pred = np.where(mask_img, mask_img, img_pred)
+        # Apply predicted masks and boxes
+        overlay = result['image'].copy()
+        for j, (box, label, score, mask, iou) in enumerate(zip(
+                result['pred_boxes'],
+                result['pred_labels'],
+                result['pred_scores'],
+                result['pred_masks'],
+                result['ious'])):
 
-                # Also draw bounding box
-                box = result['pred_boxes'][j]
-                x1, y1, x2, y2 = box
-                plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                                                  fill=False, edgecolor='red', linewidth=2))
-                plt.text(x1, y1, f"{class_names[label - 1]}: {score:.2f}",
-                         bbox=dict(facecolor='red', alpha=0.5))
+            # Color based on IoU
+            if iou >= 0.7:
+                color = [0, 255, 0]  # Green for good IoU
+                edge_color = 'lime'
+            elif iou >= 0.5:
+                color = [255, 255, 0]  # Yellow for medium IoU
+                edge_color = 'yellow'
+            else:
+                color = [255, 0, 0]  # Red for poor IoU
+                edge_color = 'red'
 
-        plt.imshow(img_pred)
+            # Apply mask with transparency
+            color_mask = np.zeros_like(overlay, dtype=np.uint8)
+            mask_binary = mask > 0.5
+            color_mask[mask_binary] = color
 
-        plt.savefig(os.path.join(dataset_path, f'segmentation_result_{i}.png'))
+            overlay = np.where(mask_binary[..., None],
+                               overlay * 0.7 + color_mask * 0.3,
+                               overlay)
+
+            # Draw bounding box
+            x1, y1, x2, y2 = box
+            plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                              fill=False, edgecolor=edge_color, linewidth=2))
+
+            cls_name = class_names[label - 1] if label - 1 < len(class_names) else f"Class {label}"
+            plt.text(x1, y1, f"{cls_name}: {score:.2f}, IoU: {iou:.2f}",
+                     bbox=dict(facecolor=edge_color, alpha=0.5))
+
+        plt.imshow(overlay)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_dir, f'segmentation_result_{i}.png'), dpi=200)
         plt.close()
+
+    print(f"Visualizations saved to {results_dir}")
+    return os.path.join(results_dir, 'segmentation_results.png')
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='One-Stage Instance Segmentation')
+    parser = argparse.ArgumentParser(description='One-Stage Instance Segmentation using Mask R-CNN')
     parser.add_argument('--dataset_path', type=str, default='dataset_E4888', help='Path to the dataset')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
+    parser.add_argument('--subset_size', type=float, default=1.0,
+                        help='Fraction of dataset to use (0.0-1.0). Use 0.5 for 50% of images.')
     parser.add_argument('--skip_scratch', action='store_true', help='Skip training from scratch')
-    parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with pretrained weights')
+    parser.add_argument('--skip_pretrained', action='store_true', help='Skip training with transfer learning')
     parser.add_argument('--eval_only', action='store_true', help='Only evaluate the model')
+    parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for evaluation')
     return parser.parse_args()
 
 
@@ -465,52 +908,78 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(args.dataset_path, 'models'), exist_ok=True)
     os.makedirs(os.path.join(args.dataset_path, 'results'), exist_ok=True)
 
-    # Training and evaluation
+    # By default, train both model types unless specifically skipped
     if not args.eval_only:
         # Train model from scratch
         if not args.skip_scratch:
-            print("Training model from scratch...")
-            model_scratch, losses_scratch, val_losses_scratch = train_model(
-                args.dataset_path, use_pretrained=False, num_epochs=args.epochs)
+            print("\n===== TRAINING SEGMENTATION FROM SCRATCH =====")
+            model_scratch, losses_scratch, val_scores_scratch = train_model(
+                args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
-            print("Training model with pre-trained weights...")
-            model_pretrained, losses_pretrained, val_losses_pretrained = train_model(
-                args.dataset_path, use_pretrained=True, num_epochs=args.epochs)
+            print("\n===== TRAINING SEGMENTATION WITH TRANSFER LEARNING =====")
+            model_pretrained, losses_pretrained, val_scores_pretrained = train_model(
+                args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size)
 
-            # Compare training losses if both models were trained
-            if not args.skip_scratch:
-                plt.figure(figsize=(12, 6))
-                plt.subplot(1, 2, 1)
-                plt.plot(losses_scratch, label='From Scratch')
-                plt.plot(losses_pretrained, label='Pre-trained')
-                plt.title('Training Loss Comparison')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.legend()
+        # Compare both models if both were trained
+        if not args.skip_scratch and not args.skip_pretrained:
+            print("\n===== COMPARING TRAINING APPROACHES =====")
+            plt.figure(figsize=(12, 6))
 
-                plt.subplot(1, 2, 2)
-                plt.plot(val_losses_scratch, label='From Scratch')
-                plt.plot(val_losses_pretrained, label='Pre-trained')
-                plt.title('Validation Loss Comparison')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.legend()
+            plt.subplot(1, 2, 1)
+            plt.plot(losses_scratch, label='From Scratch')
+            plt.plot(losses_pretrained, label='Transfer Learning')
+            plt.title('Training Loss Comparison')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
 
-                plt.savefig(os.path.join(args.dataset_path, 'segmentation_loss_comparison.png'))
+            plt.subplot(1, 2, 2)
+            plt.plot(val_scores_scratch, label='From Scratch')
+            plt.plot(val_scores_pretrained, label='Transfer Learning')
+            plt.title('Validation mAP Comparison')
+            plt.xlabel('Epoch')
+            plt.ylabel('mAP@0.5')
+            plt.legend()
 
-    # Evaluate model
-    print("Evaluating pre-trained model...")
-    # Load model
-    model = get_instance_segmentation_model(num_classes=len(TARGET_CLASSES) + 1)
-    model_path = os.path.join(args.dataset_path, 'instance_segmentation_model.pth')
+            plt.tight_layout()
+            comparison_path = os.path.join(args.dataset_path, 'segmentation_comparison.png')
+            plt.savefig(comparison_path)
+            plt.close()
+            print(f"Training comparison saved to {comparison_path}")
 
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path))
-        results = evaluate_model(model, args.dataset_path)
-        visualize_segmentation_results(results, args.dataset_path)
-    else:
-        print(f"Model file not found: {model_path}")
-        if args.eval_only:
-            print("Please train the model first or provide a valid model path.")
+    # Evaluation - use best transfer model by default
+    if args.eval_only or not args.skip_pretrained:
+        print("\n===== EVALUATION =====")
+
+        # Define models to evaluate
+        models_to_evaluate = []
+
+        # Add transfer learning model if available
+        transfer_model_path = os.path.join(args.dataset_path, 'best_transfer_segmentation_model.pth')
+        if os.path.exists(transfer_model_path):
+            models_to_evaluate.append(('transfer', transfer_model_path))
+
+        # Add scratch model if available
+        scratch_model_path = os.path.join(args.dataset_path, 'best_scratch_segmentation_model.pth')
+        if os.path.exists(scratch_model_path):
+            models_to_evaluate.append(('scratch', scratch_model_path))
+
+        # Evaluate each available model
+        for model_name, model_path in models_to_evaluate:
+            print(f"\nEvaluating {model_name} model from: {model_path}")
+
+            # Load model
+            model = get_instance_segmentation_model(num_classes=len(TARGET_CLASSES) + 1)
+            model.load_state_dict(torch.load(model_path))
+
+            # Run evaluation
+            results, metrics = evaluate_model(model, args.dataset_path, confidence_threshold=args.confidence)
+
+            # Save results with model name prefix
+            result_dir = os.path.join(args.dataset_path, f'results_segmentation_{model_name}')
+            os.makedirs(result_dir, exist_ok=True)
+
+            visualize_segmentation_results(results, result_dir, metrics)
+            print(f"Results saved to: {result_dir}")
