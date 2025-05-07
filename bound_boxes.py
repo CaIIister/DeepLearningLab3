@@ -119,7 +119,6 @@ def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_thresho
         scratch_labels = scratch_preds['labels'].cpu().numpy()[
                              scratch_keep] - 1  # -1 to map back to TARGET_CLASSES index
         scratch_scores = scratch_scores[scratch_keep]
-        scratch_masks = scratch_preds['masks'].cpu().numpy()[scratch_keep, 0]  # First channel contains the mask
 
         transfer_scores = transfer_preds['scores'].cpu().numpy()
         transfer_keep = transfer_scores > confidence_threshold
@@ -127,7 +126,6 @@ def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_thresho
         transfer_labels = transfer_preds['labels'].cpu().numpy()[
                               transfer_keep] - 1  # -1 to map back to TARGET_CLASSES index
         transfer_scores = transfer_scores[transfer_keep]
-        transfer_masks = transfer_preds['masks'].cpu().numpy()[transfer_keep, 0]  # First channel contains the mask
 
         # Calculate average confidence scores
         scratch_avg_conf = scratch_scores.mean() if len(scratch_scores) > 0 else 0
@@ -149,26 +147,13 @@ def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_thresho
             axes[0].text(xmin, ymin, TARGET_CLASSES[label_idx],
                          bbox=dict(facecolor='green', alpha=0.5), fontsize=10)
 
-        # Model from Scratch
-        axes[1].imshow(img_np)
+        # Model from Scratch - FIXED TO SHOW ORIGINAL IMAGE
+        axes[1].imshow(img_np)  # Use original image
         axes[1].set_title(f'From Scratch (Avg Conf: {scratch_avg_conf:.2f})')
         axes[1].axis('off')
 
-        # Create a blend of the image and the mask predictions for scratch model
-        scratch_overlay = img_np.copy()
-        for box, label_idx, score, mask in zip(scratch_boxes, scratch_labels, scratch_scores, scratch_masks):
-            # Apply mask with transparency
-            mask_binary = mask > 0.5
-            mask_color = np.zeros_like(scratch_overlay, dtype=np.uint8)
-            mask_color[mask_binary] = [255, 0, 0]  # Red for scratch model
-
-            # Blend image and mask
-            scratch_overlay = np.where(
-                mask_binary[..., None],
-                scratch_overlay * 0.7 + mask_color * 0.3,
-                scratch_overlay
-            )
-
+        # Draw only bounding boxes without mask overlay
+        for box, label_idx, score in zip(scratch_boxes, scratch_labels, scratch_scores):
             # Draw bounding box
             xmin, ymin, xmax, ymax = box
             rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
@@ -180,28 +165,13 @@ def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_thresho
             axes[1].text(xmin, ymin, f"{class_name}: {score:.2f}",
                          bbox=dict(facecolor='red', alpha=0.5), fontsize=10)
 
-        axes[1].imshow(scratch_overlay)
-
-        # Transfer Learning
-        axes[2].imshow(img_np)
+        # Transfer Learning - FIXED TO SHOW ORIGINAL IMAGE
+        axes[2].imshow(img_np)  # Use original image
         axes[2].set_title(f'Transfer Learning (Avg Conf: {transfer_avg_conf:.2f})')
         axes[2].axis('off')
 
-        # Create a blend of the image and the mask predictions for transfer model
-        transfer_overlay = img_np.copy()
-        for box, label_idx, score, mask in zip(transfer_boxes, transfer_labels, transfer_scores, transfer_masks):
-            # Apply mask with transparency
-            mask_binary = mask > 0.5
-            mask_color = np.zeros_like(transfer_overlay, dtype=np.uint8)
-            mask_color[mask_binary] = [0, 0, 255]  # Blue for transfer model
-
-            # Blend image and mask
-            transfer_overlay = np.where(
-                mask_binary[..., None],
-                transfer_overlay * 0.7 + mask_color * 0.3,
-                transfer_overlay
-            )
-
+        # Draw only bounding boxes without mask overlay
+        for box, label_idx, score in zip(transfer_boxes, transfer_labels, transfer_scores):
             # Draw bounding box
             xmin, ymin, xmax, ymax = box
             rect = plt.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
@@ -212,8 +182,6 @@ def generate_bbox_visualizations(dataset_path, num_samples=5, confidence_thresho
             class_name = TARGET_CLASSES[label_idx] if 0 <= label_idx < len(TARGET_CLASSES) else f"Class {label_idx + 1}"
             axes[2].text(xmin, ymin, f"{class_name}: {score:.2f}",
                          bbox=dict(facecolor='blue', alpha=0.5), fontsize=10)
-
-        axes[2].imshow(transfer_overlay)
 
         # Save figure
         plt.tight_layout()
@@ -230,6 +198,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate bounding box visualizations')
     parser.add_argument('--dataset_path', type=str, default='dataset_E4888', help='Path to the dataset')
     parser.add_argument('--num_samples', type=int, default=3, help='Number of sample images to visualize')
+    parser.add_argument('--confidence', type=float, default=0.5, help='Confidence threshold for visualization')
     args = parser.parse_args()
 
-    generate_bbox_visualizations(args.dataset_path, args.num_samples)
+    generate_bbox_visualizations(args.dataset_path, args.num_samples, args.confidence)

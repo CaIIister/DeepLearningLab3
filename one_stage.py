@@ -124,7 +124,6 @@ class VOCInstanceSegmentationDataset(Dataset):
         # Get original image dimensions
         orig_width, orig_height = img.size
 
-
         # Load mask
         mask_path = self.segmentations[idx]
         mask = Image.open(mask_path)
@@ -190,14 +189,14 @@ class VOCInstanceSegmentationDataset(Dataset):
         if not boxes:  # Handle case with no valid boxes
             boxes = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros(0, dtype=torch.int64)
-            masks = torch.zeros((0, height, width), dtype=torch.uint8)
+            masks = torch.zeros((0, target_size[1], target_size[0]), dtype=torch.uint8)
         else:
             boxes = torch.as_tensor(boxes, dtype=torch.float32)
             labels = torch.as_tensor(labels, dtype=torch.int64)
             if len(masks) > 0:
                 masks = torch.as_tensor(masks, dtype=torch.uint8)
             else:
-                masks = torch.zeros((0, height, width), dtype=torch.uint8)
+                masks = torch.zeros((0, target_size[1], target_size[0]), dtype=torch.uint8)
 
         image_id = torch.tensor([idx])
         area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
@@ -277,6 +276,28 @@ def get_instance_segmentation_model(num_classes, pretrained=True):
         in_features_mask, hidden_layer, num_classes)
 
     return model
+
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two bounding boxes"""
+    # Convert to [x1, y1, x2, y2] format
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    # Calculate area of intersection
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
+    intersection = w * h
+
+    # Calculate area of union
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = box1_area + box2_area - intersection
+
+    # Return IoU
+    return intersection / union if union > 0 else 0
 
 
 def calculate_map(predictions, targets, iou_threshold=0.5):
@@ -376,29 +397,123 @@ def calculate_map(predictions, targets, iou_threshold=0.5):
     return np.mean(aps) if aps else 0.0
 
 
-def calculate_iou(box1, box2):
-    """Calculate Intersection over Union between two bounding boxes"""
-    # Convert to [x1, y1, x2, y2] format
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+def calculate_metrics(predictions, targets, iou_threshold=0.5):
+    """Calculate comprehensive metrics for object detection/segmentation"""
 
-    # Calculate area of intersection
-    w = max(0, x2 - x1)
-    h = max(0, y2 - y1)
-    intersection = w * h
+    # Initialize counters
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_correct_class = 0
+    total_predictions = 0
+    total_gt = 0
 
-    # Calculate area of union
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = box1_area + box2_area - intersection
+    # Per class statistics
+    class_stats = {i + 1: {'tp': 0, 'fp': 0, 'fn': 0} for i in range(len(TARGET_CLASSES))}
 
-    # Return IoU
-    return intersection / union if union > 0 else 0
+    # Process each image
+    for pred, target in zip(predictions, targets):
+        pred_boxes = pred['boxes']
+        pred_labels = pred['labels']
+        pred_scores = pred['scores']
+
+        gt_boxes = target['boxes']
+        gt_labels = target['labels']
+
+        # Track matched ground truth boxes
+        matched_gt = [False] * len(gt_boxes)
+
+        # Count total ground truth objects
+        total_gt += len(gt_boxes)
+
+        # For each prediction
+        for i, (pred_box, pred_label, pred_score) in enumerate(zip(pred_boxes, pred_labels, pred_scores)):
+            # Only consider predictions above threshold
+            if pred_score < 0.5:
+                continue
+
+            total_predictions += 1
+
+            # Find best matching ground truth
+            best_iou = 0
+            best_gt_idx = -1
+
+            for j, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
+                # Skip already matched ground truths
+                if matched_gt[j]:
+                    continue
+
+                # Only compare with same class
+                if pred_label == gt_label:
+                    iou = calculate_iou(pred_box, gt_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_gt_idx = j
+
+            # Check if we found a match above threshold
+            if best_gt_idx >= 0 and best_iou >= iou_threshold:
+                total_tp += 1
+                if pred_label.item() in class_stats:
+                    class_stats[pred_label.item()]['tp'] += 1
+                matched_gt[best_gt_idx] = True
+
+                # Correct class prediction
+                total_correct_class += 1
+            else:
+                total_fp += 1
+                if pred_label.item() in class_stats:
+                    class_stats[pred_label.item()]['fp'] += 1
+
+        # Count false negatives
+        for j, matched in enumerate(matched_gt):
+            if not matched:
+                total_fn += 1
+                if gt_labels[j].item() in class_stats:
+                    class_stats[gt_labels[j].item()]['fn'] += 1
+
+    # Calculate global metrics
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    accuracy = total_tp / total_predictions if total_predictions > 0 else 0
+
+    # Calculate per-class metrics
+    class_metrics = {}
+    for class_id, stats in class_stats.items():
+        if class_id - 1 < len(TARGET_CLASSES):
+            class_name = TARGET_CLASSES[class_id - 1]
+
+            class_precision = stats['tp'] / (stats['tp'] + stats['fp']) if (stats['tp'] + stats['fp']) > 0 else 0
+            class_recall = stats['tp'] / (stats['tp'] + stats['fn']) if (stats['tp'] + stats['fn']) > 0 else 0
+            class_f1 = 2 * (class_precision * class_recall) / (class_precision + class_recall) if (
+                                                                                                              class_precision + class_recall) > 0 else 0
+
+            class_metrics[class_name] = {
+                'precision': class_precision,
+                'recall': class_recall,
+                'f1': class_f1
+            }
+
+    # Calculate mAP
+    map_score = calculate_map(predictions, targets, iou_threshold)
+
+    metrics = {
+        'map': map_score,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'accuracy': accuracy,
+        'class_metrics': class_metrics,
+        'true_positives': total_tp,
+        'false_positives': total_fp,
+        'false_negatives': total_fn
+    }
+
+    return metrics
 
 
-def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0, early_stopping_patience=3, accumulation_steps=4):
+def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.0,
+                early_stopping_patience=3, accumulation_steps=4, batch_size=2):
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
@@ -440,7 +555,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     # Dataloaders
     data_loader_train = DataLoader(
         dataset_train,
-        batch_size=2,
+        batch_size=batch_size,  # Use batch_size parameter
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
         collate_fn=collate_fn
@@ -476,7 +591,7 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     # Training loop
     print("Starting training...")
     print(
-        f"Using gradient accumulation with {accumulation_steps} steps (effective batch size: {2 * accumulation_steps})")
+        f"Using gradient accumulation with {accumulation_steps} steps (effective batch size: {batch_size * accumulation_steps})")
     start_time = time.time()
 
     # Track metrics
@@ -484,10 +599,6 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
     val_maps = []
     best_map = 0.0
     patience_counter = 0
-
-
-    # Only zero out gradients once per accumulation cycle
-    optimizer.zero_grad()
 
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
@@ -497,53 +608,63 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
         running_loss = 0.0
         batch_count = 0
 
+        # Zero gradients before the loop
+        optimizer.zero_grad()
+
         for i, (images, targets) in enumerate(tqdm(data_loader_train)):
             batch_count += 1
 
-            # Move data to device
-            images = list(image.to(device) if isinstance(image, torch.Tensor)
-                          else get_transform()(image).to(device) for image in images)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            # Skip batches with no boxes
-            if any(len(t['boxes']) == 0 for t in targets):
-                print("Skipping batch with empty targets")
-                continue
-
-            # Reset gradients
-            #optimizer.zero_grad()
+            # Process images one by one to save memory
+            loss_value = 0.0
 
             try:
-                # Forward pass
-                loss_dict = model(images, targets)
+                # Process one image at a time
+                for img_idx in range(len(images)):
+                    single_img = [images[img_idx]]
+                    single_target = [targets[img_idx]]
 
-                # Calculate standard loss (sum of all loss components)
-                losses = sum(loss for loss in loss_dict.values())
+                    # Move to device
+                    single_img = [img.to(device) if isinstance(img, torch.Tensor)
+                                  else get_transform()(img).to(device) for img in single_img]
+                    single_target = [{k: v.to(device) for k, v in t.items()} for t in single_target]
 
-                # Normalize loss to account for batch accumulation
-                losses = losses / accumulation_steps
+                    # Skip if no boxes
+                    if any(len(t['boxes']) == 0 for t in single_target):
+                        continue
 
-                # Backward pass (accumulate gradients)
-                losses.backward()
+                    # Forward pass
+                    loss_dict = model(single_img, single_target)
 
-                # Record loss value
-                loss_value = losses.item() * accumulation_steps  # Scale back for reporting
-                running_loss += loss_value
+                    # Calculate loss and normalize by accumulation steps and batch size
+                    losses = sum(loss for loss in loss_dict.values()) / accumulation_steps / len(images)
 
-                # Update weights only after accumulation_steps
+                    # Backward
+                    losses.backward()
+
+                    # Add to loss value
+                    loss_value += losses.item() * accumulation_steps * len(images) / len(single_img)
+
+                # Update weights only when accumulation steps are reached
                 if (i + 1) % accumulation_steps == 0 or (i + 1) == len(data_loader_train):
-                    # Add gradient clipping to prevent exploding gradients
+                    # Clip gradients
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                    # Update weights
+                    # Step optimizer
                     optimizer.step()
 
-                    # Reset gradients
+                    # Zero gradients
                     optimizer.zero_grad()
 
+                    # Clear cache
+                    torch.cuda.empty_cache()
+
+                # Update running loss
+                running_loss += loss_value
 
             except Exception as e:
                 print(f"Error in training batch: {e}")
+                # Clear cache
+                torch.cuda.empty_cache()
                 continue
 
         # Calculate average training loss
@@ -564,14 +685,27 @@ def train_model(dataset_path, use_pretrained=True, num_epochs=10, subset_size=1.
                 # Run model
                 outputs = model(images)
 
-                # Store predictions and targets for mAP calculation
+                # Store predictions and targets for metrics calculation
                 all_predictions.extend([{k: v.cpu() for k, v in t.items()} for t in outputs])
                 all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
 
-        # Calculate mAP
-        val_map = calculate_map(all_predictions, all_targets)
+        # Calculate metrics
+        val_metrics = calculate_metrics(all_predictions, all_targets)
+        val_map = val_metrics['map']
         val_maps.append(val_map)
-        print(f"Validation mAP@0.5: {val_map:.4f}")
+
+        # Print metrics
+        print(f"Validation Metrics:")
+        print(f"  mAP@0.5: {val_map:.4f}")
+        print(f"  Precision: {val_metrics['precision']:.4f}")
+        print(f"  Recall: {val_metrics['recall']:.4f}")
+        print(f"  F1 Score: {val_metrics['f1']:.4f}")
+        print(f"  Accuracy: {val_metrics['accuracy']:.4f}")
+
+        # Print per-class metrics
+        for class_name, metrics in val_metrics['class_metrics'].items():
+            print(
+                f"  {class_name}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, F1={metrics['f1']:.4f}")
 
         # Update learning rate scheduler
         lr_scheduler.step(1.0 - val_map)  # Use inverted mAP as "loss" to minimize
@@ -703,24 +837,21 @@ def evaluate_model(model, dataset_path, num_samples=5, confidence_threshold=0.5)
             'recall': recall
         })
 
-    # Calculate overall metrics
-    map_score = calculate_map(all_predictions, all_targets)
+    # Calculate all metrics
+    metrics = calculate_metrics(all_predictions, all_targets)
 
     # Print metrics
     print(f"Evaluation Metrics:")
-    print(f"  mAP@0.5: {map_score:.4f}")
+    print(f"  mAP@0.5: {metrics['map']:.4f}")
+    print(f"  Precision: {metrics['precision']:.4f}")
+    print(f"  Recall: {metrics['recall']:.4f}")
+    print(f"  F1 Score: {metrics['f1']:.4f}")
+    print(f"  Accuracy: {metrics['accuracy']:.4f}")
 
-    avg_precision = np.mean([r['precision'] for r in results])
-    avg_recall = np.mean([r['recall'] for r in results])
-
-    print(f"  Average Precision: {avg_precision:.4f}")
-    print(f"  Average Recall: {avg_recall:.4f}")
-
-    metrics = {
-        'map': map_score,
-        'precision': avg_precision,
-        'recall': avg_recall
-    }
+    # Print per-class metrics
+    for class_name, class_metrics in metrics['class_metrics'].items():
+        print(
+            f"  {class_name}: Precision={class_metrics['precision']:.4f}, Recall={class_metrics['recall']:.4f}, F1={class_metrics['f1']:.4f}")
 
     return results, metrics
 
@@ -740,7 +871,7 @@ def visualize_segmentation_results(results, dataset_path, metrics=None):
     # Add metrics to title if available
     title = "Instance Segmentation Results"
     if metrics:
-        title += f" (mAP@0.5: {metrics['map']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f})"
+        title += f" (mAP: {metrics['map']:.4f}, F1: {metrics['f1']:.4f}, Acc: {metrics['accuracy']:.4f})"
 
     plt.suptitle(title, fontsize=16)
 
@@ -947,13 +1078,17 @@ if __name__ == "__main__":
         if not args.skip_scratch:
             print("\n===== TRAINING SEGMENTATION FROM SCRATCH =====")
             model_scratch, losses_scratch, val_scores_scratch = train_model(
-                args.dataset_path, use_pretrained=False, num_epochs=args.epochs, subset_size=args.subset_size, accumulation_steps=4)
+                args.dataset_path, use_pretrained=False, num_epochs=args.epochs,
+                subset_size=args.subset_size, accumulation_steps=args.accumulation_steps,
+                batch_size=args.batch_size)
 
         # Train model with pre-trained weights
         if not args.skip_pretrained:
             print("\n===== TRAINING SEGMENTATION WITH TRANSFER LEARNING =====")
             model_pretrained, losses_pretrained, val_scores_pretrained = train_model(
-                args.dataset_path, use_pretrained=True, num_epochs=args.epochs, subset_size=args.subset_size, accumulation_steps=4)
+                args.dataset_path, use_pretrained=True, num_epochs=args.epochs,
+                subset_size=args.subset_size, accumulation_steps=args.accumulation_steps,
+                batch_size=args.batch_size)
 
         # Compare both models if both were trained
         if not args.skip_scratch and not args.skip_pretrained:
